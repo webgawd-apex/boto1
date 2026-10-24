@@ -299,16 +299,16 @@ ASK_ADDRESS, ASK_NAME = range(2)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 *Solana Wallet Watcher*\n\n"
+        "👋 <b>Solana Wallet Watcher</b>\n\n"
         "I monitor Solana wallets in real time and alert you when they buy "
         "or receive new tokens, complete with an on-chain safety score.\n\n"
-        "*Commands:*\n"
+        "<b>Commands:</b>\n"
         "• /new_watch — Add a wallet to watch (max 10)\n"
         "• /my_watches — List your tracked wallets\n"
-        "• /remove_watch <name> — Stop tracking a wallet\n"
+        "• /remove_watch &lt;name&gt; — Stop tracking a wallet\n"
         "• /cancel — Abort the current operation"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -357,7 +357,7 @@ async def recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
-    await update.message.reply_text(f"Watching '{name}' → `{addr}`", parse_mode="Markdown")
+    await update.message.reply_text(f"Watching '{name}' → {addr}")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -374,21 +374,31 @@ async def cmd_my_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("No wallets tracked. Use /new_watch.")
         return
-    lines = [f"*Your wallets* ({len(rows)}/{MAX_WALLETS})"]
+    lines = [f"<b>Your wallets</b> ({len(rows)}/{MAX_WALLETS})"]
     for name, addr in rows:
-        lines.append(f"• `{name}` — `{addr[:4]}...{addr[-4:]}`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append(f"• <code>{name}</code> — <code>{addr[:4]}...{addr[-4:]}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
+    text = (update.message.text or "").strip()
+    if context.args:
+        name = " ".join(context.args).strip()
+    else:
+        parts = text.split(maxsplit=1)
+        name = parts[1].strip() if len(parts) > 1 else ""
+
+    if not name:
         await update.message.reply_text("Usage: /remove_watch <name>")
         return
-    name = " ".join(context.args).strip()
     if db_remove(update.effective_user.id, name):
         await update.message.reply_text(f"Removed '{name}'.")
     else:
         await update.message.reply_text(f"No wallet named '{name}'.")
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Telegram handler error: %s", context.error)
 
 
 # --- Monitor ----------------------------------------------------------------
@@ -423,8 +433,8 @@ async def send_alert(app, user_id, name, mint):
     try:
         await app.bot.send_message(
             chat_id=user_id,
-            text=f"🚨 *{name}* bought\nCA: `{mint}`\n_scanning chain..._",
-            parse_mode="Markdown",
+            text=f"🚨 <b>{name}</b> bought\nCA: <code>{mint}</code>\n<i>scanning chain...</i>",
+            parse_mode="HTML",
         )
     except Exception as e:
         log.warning("alert send failed: %s", e)
@@ -441,8 +451,8 @@ async def send_verdict(app, user_id, mint):
     emoji = {"SAFE": "✅", "WARN": "⚠️", "DANGER": "🔴", "UNKNOWN": "❓"}.get(verdict, "❓")
     risk_text = "\n".join(f"• {r}" for r in risks) if risks else "No structural red flags"
     text = (
-        f"{emoji} *{verdict}* — safety {score}/100\n"
-        f"CA: `{mint}`\n"
+        f"{emoji} <b>{verdict}</b> — safety {score}/100\n"
+        f"CA: <code>{mint}</code>\n"
         f"{risk_text}"
     )
 
@@ -459,7 +469,7 @@ async def send_verdict(app, user_id, mint):
         await app.bot.send_message(
             chat_id=user_id,
             text=text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=keyboard,
             disable_web_page_preview=True,
         )
@@ -537,33 +547,54 @@ def main():
     start_health_server()
     db_init()
 
-    # Python 3.12+ / 3.14 no longer auto-creates an event loop in get_event_loop().
-    # Set one explicitly so python-telegram-bot's run_polling() finds it.
+    # Ensure an active asyncio event loop exists on this thread (required for Python 3.12+ / 3.14)
     try:
-        asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .build()
+    )
 
-    # /new_watch is a two-step conversation. The fallback /cancel and the
-    # standalone /cancel share one handler, so cancelling works either way.
-    # Both underscore and solid aliases are accepted.
+    # /new_watch is a two-step conversation. Supports underscore, solid,
+    # and hyphenated aliases.
     new_watch = ConversationHandler(
-        entry_points=[CommandHandler(["new_watch", "newwatch"], cmd_new_watch)],
+        entry_points=[
+            CommandHandler(["new_watch", "newwatch"], cmd_new_watch),
+            MessageHandler(filters.Regex(r"^/new[-_]?watch"), cmd_new_watch),
+        ],
         states={
             ASK_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_address)],
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_name)],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(filters.Regex(r"^/cancel"), cmd_cancel),
+        ],
     )
 
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
+    application.add_handler(MessageHandler(filters.Regex(r"^/(start|help)"), cmd_start))
     application.add_handler(new_watch)
     application.add_handler(CommandHandler(["my_watches", "mywatches"], cmd_my_watches))
+    application.add_handler(MessageHandler(filters.Regex(r"^/my[-_]?watches"), cmd_my_watches))
     application.add_handler(CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch))
+    application.add_handler(MessageHandler(filters.Regex(r"^/remove[-_]?watch"), cmd_remove_watch))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
+    application.add_handler(MessageHandler(filters.Regex(r"^/cancel"), cmd_cancel))
+    application.add_error_handler(on_error)
 
     application.run_polling()
 
