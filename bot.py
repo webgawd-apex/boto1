@@ -293,6 +293,7 @@ def check_rug(mint):
 
 # --- Telegram handlers ------------------------------------------------------
 
+BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 ASK_ADDRESS, ASK_NAME = range(2)
 
 
@@ -303,7 +304,7 @@ async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # shouldn't get blocked after they've already typed an address.
     if db_count(user_id) >= MAX_WALLETS:
         await update.message.reply_text(
-            f"You already track {MAX_WALLETS} wallets. Remove one with /remove-watch <name>."
+            f"You already track {MAX_WALLETS} wallets. Remove one with /remove_watch <name>."
         )
         return ConversationHandler.END
 
@@ -316,7 +317,7 @@ async def recv_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = update.message.text.strip()
     # Shallow validation only — 32-44 base58 chars. The RPC finds nothing
     # if the address is wrong; we don't verify the checksum here.
-    if not (32 <= len(addr) <= 44) or not all(c.isalnum() for c in addr):
+    if not (32 <= len(addr) <= 44) or not all(c in BASE58_ALPHABET for c in addr):
         await update.message.reply_text("That doesn't look like a Solana address. Try again or /cancel.")
         return ASK_ADDRESS
     context.user_data["address"] = addr
@@ -333,7 +334,7 @@ async def recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     addr = context.user_data.get("address")
     if not addr:
-        await update.message.reply_text("Something went wrong. Start over with /new-watch.")
+        await update.message.reply_text("Something went wrong. Start over with /new_watch.")
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -357,7 +358,7 @@ async def cmd_my_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = db_list(user_id)
     if not rows:
-        await update.message.reply_text("No wallets tracked. Use /new-watch.")
+        await update.message.reply_text("No wallets tracked. Use /new_watch.")
         return
     lines = [f"*Your wallets* ({len(rows)}/{MAX_WALLETS})"]
     for name, addr in rows:
@@ -367,7 +368,7 @@ async def cmd_my_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /remove-watch <name>")
+        await update.message.reply_text("Usage: /remove_watch <name>")
         return
     name = " ".join(context.args).strip()
     if db_remove(update.effective_user.id, name):
@@ -513,10 +514,11 @@ def main():
     db_init()
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
-    # /new-watch is a two-step conversation. The fallback /cancel and the
+    # /new_watch is a two-step conversation. The fallback /cancel and the
     # standalone /cancel share one handler, so cancelling works either way.
+    # Both underscore and solid aliases are accepted.
     new_watch = ConversationHandler(
-        entry_points=[CommandHandler("new-watch", cmd_new_watch)],
+        entry_points=[CommandHandler(["new_watch", "newwatch"], cmd_new_watch)],
         states={
             ASK_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_address)],
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_name)],
@@ -525,8 +527,8 @@ def main():
     )
 
     application.add_handler(new_watch)
-    application.add_handler(CommandHandler("my-watches", cmd_my_watches))
-    application.add_handler(CommandHandler("remove-watch", cmd_remove_watch))
+    application.add_handler(CommandHandler(["my_watches", "mywatches"], cmd_my_watches))
+    application.add_handler(CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
 
     application.run_polling()
