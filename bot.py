@@ -5,13 +5,14 @@ import sqlite3
 import base64
 import struct
 import logging
+import html
 from dotenv import load_dotenv
 import requests
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, ConversationHandler,
-    MessageHandler, filters, ContextTypes
+    MessageHandler, filters, ContextTypes, CallbackQueryHandler
 )
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -41,6 +42,7 @@ def start_health_server():
         return
     try:
         port = int(port_str)
+
         class HealthHandler(BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
@@ -305,7 +307,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Commands:</b>\n"
         "• /new_watch — Add a wallet to watch (max 10)\n"
         "• /my_watches — List your tracked wallets\n"
-        "• /remove_watch &lt;name&gt; — Stop tracking a wallet\n"
+        "• /remove_watch — Remove a wallet (pick from list)\n"
         "• /cancel — Abort the current operation"
     )
     await update.message.reply_text(text, parse_mode="HTML")
@@ -318,7 +320,7 @@ async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # shouldn't get blocked after they've already typed an address.
     if db_count(user_id) >= MAX_WALLETS:
         await update.message.reply_text(
-            f"You already track {MAX_WALLETS} wallets. Remove one with /remove_watch <name>."
+            f"You already track {MAX_WALLETS} wallets. Remove one with /remove_watch first."
         )
         return ConversationHandler.END
 
@@ -376,25 +378,106 @@ async def cmd_my_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = [f"<b>Your wallets</b> ({len(rows)}/{MAX_WALLETS})"]
     for name, addr in rows:
-        lines.append(f"• <code>{name}</code> — <code>{addr[:4]}...{addr[-4:]}</code>")
+        lines.append(f"• <code>{html.escape(name)}</code> — <code>{addr[:4]}...{addr[-4:]}</code>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if context.args:
-        name = " ".join(context.args).strip()
-    else:
-        parts = text.split(maxsplit=1)
-        name = parts[1].strip() if len(parts) > 1 else ""
+# --- Remove flow (callback-based, no argument needed) -----------------------
+# Analysis: /remove_watch takes no argument now. It renders the user's wallets
+# as a vertical inline keyboard. Tapping a wallet edits the same message into
+# a Confirm / Cancel pair, so the conversation stays on one message and there
+# is no drift between "the list I saw" and "the wallet I meant".
+#
+# Callback payload format:
+#   rm:pick:<name>   -> user tapped a wallet, show confirm
+#   rm:yes:<name>    -> user confirmed
+#   rm:no            -> user cancelled
 
-    if not name:
-        await update.message.reply_text("Usage: /remove_watch <name>")
+async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    rows = db_list(user_id)
+
+    if not rows:
+        await update.message.reply_text("No wallets tracked. Use /new_watch first.")
         return
-    if db_remove(update.effective_user.id, name):
-        await update.message.reply_text(f"Removed '{name}'.")
-    else:
-        await update.message.reply_text(f"No wallet named '{name}'.")
+
+    buttons = [
+        [InlineKeyboardButton(f"🗑 {name}  ({addr[:4]}...{addr[-4:]})", callback_data=f"rm:pick:{name}")]
+        for name, addr in rows
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "<b>Which wallet do you want to remove?</b>",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data or ""
+
+    # Any tap here acknowledges the button, otherwise Telegram shows a
+    # spinner on the button for ~15s.
+    await query.answer()
+
+    parts = data.split(":", 2)
+
+    # --- Pick: user chose a wallet from the list ---
+    if len(parts) == 3 and parts[0] == "rm" and parts[1] == "pick":
+        name = parts[2]
+        # The wallet may have been removed by /new_watch overwrite or another
+        # session. Re-check before showing confirm.
+        existing = dict(db_list(user_id))
+        if name not in existing:
+            await query.edit_message_text(
+                f"Wallet '{html.escape(name)}' is no longer tracked.",
+                parse_mode="HTML",
+            )
+            return
+
+        addr = existing[name]
+        confirm_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm remove", callback_data=f"rm:yes:{name}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="rm:no"),
+        ]])
+        await query.edit_message_text(
+            f"<b>Remove '{html.escape(name)}'?</b>\n<code>{addr}</code>",
+            parse_mode="HTML",
+            reply_markup=confirm_kb,
+        )
+        return
+
+    # --- Yes: user confirmed ---
+    if len(parts) == 3 and parts[0] == "rm" and parts[1] == "yes":
+        name = parts[2]
+        existing = dict(db_list(user_id))
+        addr = existing.get(name)
+        removed = db_remove(user_id, name)
+        if removed:
+            # Also drop the baseline immediately so the wallet won't be re-scanned.
+            if addr:
+                baselines.pop((user_id, addr), None)
+
+            await query.edit_message_text(
+                f"✅ Removed '<b>{html.escape(name)}</b>'.",
+                parse_mode="HTML",
+            )
+        else:
+            await query.edit_message_text(
+                f"Wallet '<b>{html.escape(name)}</b>' was already gone.",
+                parse_mode="HTML",
+            )
+        return
+
+    # --- No: user cancelled ---
+    if data == "rm:no":
+        await query.edit_message_text("Removal cancelled.")
+        return
+
+    # Unknown payload — fail gracefully.
+    await query.edit_message_text("Something went wrong. Try /remove_watch again.")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -433,7 +516,7 @@ async def send_alert(app, user_id, name, mint):
     try:
         await app.bot.send_message(
             chat_id=user_id,
-            text=f"🚨 <b>{name}</b> bought\nCA: <code>{mint}</code>\n<i>scanning chain...</i>",
+            text=f"🚨 <b>{html.escape(name)}</b> bought\nCA: <code>{mint}</code>\n<i>scanning chain...</i>",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -449,7 +532,7 @@ async def send_verdict(app, user_id, mint):
         verdict, score, risks = ("UNKNOWN", 0, ["rpc error"])
 
     emoji = {"SAFE": "✅", "WARN": "⚠️", "DANGER": "🔴", "UNKNOWN": "❓"}.get(verdict, "❓")
-    risk_text = "\n".join(f"• {r}" for r in risks) if risks else "No structural red flags"
+    risk_text = "\n".join(f"• {html.escape(r)}" for r in risks) if risks else "No structural red flags"
     text = (
         f"{emoji} <b>{verdict}</b> — safety {score}/100\n"
         f"CA: <code>{mint}</code>\n"
@@ -538,6 +621,7 @@ async def post_init(app):
             BotCommand("remove_watch", "Remove a watched wallet"),
             BotCommand("cancel", "Cancel current operation"),
         ])
+        log.info("Bot commands registered")
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
     asyncio.create_task(monitor_loop(app))
@@ -568,32 +652,22 @@ def main():
         .build()
     )
 
-    # /new_watch is a two-step conversation. Supports underscore, solid,
-    # and hyphenated aliases.
     new_watch = ConversationHandler(
-        entry_points=[
-            CommandHandler(["new_watch", "newwatch"], cmd_new_watch),
-            MessageHandler(filters.Regex(r"^/new[-_]?watch"), cmd_new_watch),
-        ],
+        entry_points=[CommandHandler(["new_watch", "newwatch"], cmd_new_watch)],
         states={
             ASK_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_address)],
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_name)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cmd_cancel),
-            MessageHandler(filters.Regex(r"^/cancel"), cmd_cancel),
-        ],
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
-    application.add_handler(MessageHandler(filters.Regex(r"^/(start|help)"), cmd_start))
     application.add_handler(new_watch)
     application.add_handler(CommandHandler(["my_watches", "mywatches"], cmd_my_watches))
-    application.add_handler(MessageHandler(filters.Regex(r"^/my[-_]?watches"), cmd_my_watches))
     application.add_handler(CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch))
-    application.add_handler(MessageHandler(filters.Regex(r"^/remove[-_]?watch"), cmd_remove_watch))
+    # All inline-button taps from /remove_watch land here.
+    application.add_handler(CallbackQueryHandler(on_remove_callback, pattern=r"^rm:"))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
-    application.add_handler(MessageHandler(filters.Regex(r"^/cancel"), cmd_cancel))
     application.add_error_handler(on_error)
 
     application.run_polling()
