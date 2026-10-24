@@ -512,6 +512,15 @@ async def post_init(app):
 def main():
     start_health_server()
     db_init()
+
+    # Python 3.12+ / 3.14 no longer auto-creates an event loop in get_event_loop().
+    # Set one explicitly so python-telegram-bot's run_polling() finds it.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     # /new_watch is a two-step conversation. The fallback /cancel and the
