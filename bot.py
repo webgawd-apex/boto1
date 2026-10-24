@@ -15,7 +15,7 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes, CallbackQueryHandler
 )
 
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import threading
 
 load_dotenv()
@@ -50,10 +50,15 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(b"Solana Wallet Watcher Bot is running.")
 
+            def do_HEAD(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+
             def log_message(self, format, *args):
                 pass
 
-        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
         log.info(f"Started Render health check server on port {port}")
@@ -300,6 +305,7 @@ ASK_ADDRESS, ASK_NAME = range(2)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     text = (
         "👋 <b>Solana Wallet Watcher</b>\n\n"
         "I monitor Solana wallets in real time and alert you when they buy "
@@ -310,7 +316,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /remove_watch — Remove a wallet (pick from list)\n"
         "• /cancel — Abort the current operation"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
+    try:
+        if update.effective_message:
+            await update.effective_message.reply_text(text, parse_mode="HTML")
+    except Exception as e:
+        log.warning("cmd_start HTML reply failed: %s", e)
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "Solana Wallet Watcher\n\n"
+                "Commands:\n"
+                "/new_watch - Add a wallet to watch (max 10)\n"
+                "/my_watches - List your tracked wallets\n"
+                "/remove_watch - Remove a wallet\n"
+                "/cancel - Abort the current operation"
+            )
+    return ConversationHandler.END
 
 
 async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -319,13 +339,15 @@ async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Enforce the cap at the entry point, not mid-conversation — a user
     # shouldn't get blocked after they've already typed an address.
     if db_count(user_id) >= MAX_WALLETS:
-        await update.message.reply_text(
-            f"You already track {MAX_WALLETS} wallets. Remove one with /remove_watch first."
-        )
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                f"You already track {MAX_WALLETS} wallets. Remove one with /remove_watch first."
+            )
         return ConversationHandler.END
 
     context.user_data.clear()
-    await update.message.reply_text("Send the Solana wallet address to watch:")
+    if update.effective_message:
+        await update.effective_message.reply_text("Send the Solana wallet address to watch:")
     return ASK_ADDRESS
 
 
@@ -366,7 +388,8 @@ async def recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Cancelled.")
+    if update.effective_message:
+        await update.effective_message.reply_text("Cancelled.")
     return ConversationHandler.END
 
 
@@ -374,12 +397,23 @@ async def cmd_my_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = db_list(user_id)
     if not rows:
-        await update.message.reply_text("No wallets tracked. Use /new_watch.")
-        return
+        if update.effective_message:
+            await update.effective_message.reply_text("No wallets tracked. Use /new_watch.")
+        return ConversationHandler.END
     lines = [f"<b>Your wallets</b> ({len(rows)}/{MAX_WALLETS})"]
     for name, addr in rows:
         lines.append(f"• <code>{html.escape(name)}</code> — <code>{addr[:4]}...{addr[-4:]}</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    try:
+        if update.effective_message:
+            await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        log.warning("cmd_my_watches HTML failed: %s", e)
+        if update.effective_message:
+            plain_lines = [f"Your wallets ({len(rows)}/{MAX_WALLETS})"]
+            for name, addr in rows:
+                plain_lines.append(f"• {name} - {addr[:4]}...{addr[-4:]}")
+            await update.effective_message.reply_text("\n".join(plain_lines))
+    return ConversationHandler.END
 
 
 # --- Remove flow (callback-based, no argument needed) -----------------------
@@ -398,19 +432,22 @@ async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = db_list(user_id)
 
     if not rows:
-        await update.message.reply_text("No wallets tracked. Use /new_watch first.")
-        return
+        if update.effective_message:
+            await update.effective_message.reply_text("No wallets tracked. Use /new_watch first.")
+        return ConversationHandler.END
 
     buttons = [
         [InlineKeyboardButton(f"🗑 {name}  ({addr[:4]}...{addr[-4:]})", callback_data=f"rm:pick:{name}")]
         for name, addr in rows
     ]
     keyboard = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(
-        "<b>Which wallet do you want to remove?</b>",
-        parse_mode="HTML",
-        reply_markup=keyboard,
-    )
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "<b>Which wallet do you want to remove?</b>",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    return ConversationHandler.END
 
 
 async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -652,25 +689,43 @@ def main():
         .build()
     )
 
+    # /new_watch conversation handler with reentry and global fallbacks so
+    # user never gets trapped in an incomplete conversation.
     new_watch = ConversationHandler(
-        entry_points=[CommandHandler(["new_watch", "newwatch"], cmd_new_watch)],
+        entry_points=[
+            CommandHandler(["new_watch", "newwatch"], cmd_new_watch),
+            MessageHandler(filters.Regex(r"^/(new_watch|newwatch)$"), cmd_new_watch),
+        ],
         states={
             ASK_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_address)],
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_name)],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CommandHandler(["start", "help"], cmd_start),
+            CommandHandler(["my_watches", "mywatches"], cmd_my_watches),
+            CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch),
+        ],
+        allow_reentry=True,
     )
 
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
+    application.add_handler(MessageHandler(filters.Regex(r"^/(start|help)$"), cmd_start))
     application.add_handler(new_watch)
     application.add_handler(CommandHandler(["my_watches", "mywatches"], cmd_my_watches))
+    application.add_handler(MessageHandler(filters.Regex(r"^/(my_watches|mywatches)$"), cmd_my_watches))
     application.add_handler(CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch))
+    application.add_handler(MessageHandler(filters.Regex(r"^/(remove_watch|removewatch)$"), cmd_remove_watch))
     # All inline-button taps from /remove_watch land here.
     application.add_handler(CallbackQueryHandler(on_remove_callback, pattern=r"^rm:"))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
+    application.add_handler(MessageHandler(filters.Regex(r"^/cancel$"), cmd_cancel))
     application.add_error_handler(on_error)
 
-    application.run_polling()
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
