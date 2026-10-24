@@ -8,7 +8,7 @@ import logging
 from dotenv import load_dotenv
 import requests
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, ConversationHandler,
     MessageHandler, filters, ContextTypes
@@ -297,6 +297,20 @@ BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxy
 ASK_ADDRESS, ASK_NAME = range(2)
 
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 *Solana Wallet Watcher*\n\n"
+        "I monitor Solana wallets in real time and alert you when they buy "
+        "or receive new tokens, complete with an on-chain safety score.\n\n"
+        "*Commands:*\n"
+        "• /new_watch — Add a wallet to watch (max 10)\n"
+        "• /my_watches — List your tracked wallets\n"
+        "• /remove_watch <name> — Stop tracking a wallet\n"
+        "• /cancel — Abort the current operation"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -506,6 +520,16 @@ async def monitor_loop(app):
 # --- Entry point ------------------------------------------------------------
 
 async def post_init(app):
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "Introduce bot and show commands"),
+            BotCommand("new_watch", "Watch a Solana wallet (up to 10)"),
+            BotCommand("my_watches", "List tracked wallets"),
+            BotCommand("remove_watch", "Remove a watched wallet"),
+            BotCommand("cancel", "Cancel current operation"),
+        ])
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
     asyncio.create_task(monitor_loop(app))
 
 
@@ -535,6 +559,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
+    application.add_handler(CommandHandler(["start", "help"], cmd_start))
     application.add_handler(new_watch)
     application.add_handler(CommandHandler(["my_watches", "mywatches"], cmd_my_watches))
     application.add_handler(CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch))
