@@ -28,7 +28,7 @@ HELIUS_KEY = os.environ["HELIUS_KEY"]
 RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
 
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPwcXVYew4W"
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 LAMPORTS_PER_SOL = 1_000_000_000
 
 MAX_WALLETS = 10
@@ -1079,6 +1079,7 @@ def fetch_wallet_mints(address):
     # from "request failed". The two must not be conflated in the monitor.
     # Queries BOTH TOKEN_PROGRAM and TOKEN_2022_PROGRAM so Token-2022 purchases
     # (e.g. pump.fun tokens launched post-migration) are detected too.
+    # Only accounts with balance > 0 are counted so that selling tokens is detected immediately.
     mints = set()
 
     for program_id in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
@@ -1095,8 +1096,10 @@ def fetch_wallet_mints(address):
         for item in res.get("value", []):
             try:
                 info = item["account"]["data"]["parsed"]["info"]
-                mints.add(info["mint"])
-            except (KeyError, TypeError):
+                amt = int(info["tokenAmount"]["amount"])
+                if amt > 0:
+                    mints.add(info["mint"])
+            except (KeyError, TypeError, ValueError):
                 continue
 
     return mints
