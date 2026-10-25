@@ -327,6 +327,7 @@ def parse_token2022_extensions(data):
         offset += ext_len
     return extensions
 
+
 def fetch_dex_paid(mint):
     try:
         url = f"https://api.dexscreener.com/orders/v1/solana/{mint}"
@@ -344,12 +345,17 @@ def fetch_dex_paid(mint):
             if boosts:
                 return True
             for o in orders:
-                if isinstance(o, dict) and o.get("status") in ("approved", "processing"):
-                    return True
-            return bool(orders)
+                if isinstance(o, dict):
+                    status = o.get("status")
+                    if status in ("approved", "processing"):
+                        return True
+                    if o.get("paymentTimestamp") and status not in ("cancelled", "rejected", "failed"):
+                        return True
+            return False
         return False
     except Exception:
         return False
+
 
 def check_rug(mint):
     score = 100
