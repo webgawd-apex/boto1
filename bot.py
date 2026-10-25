@@ -102,6 +102,12 @@ def db_init():
             UNIQUE(user_id, name)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS personal_wallets (
+            user_id  INTEGER PRIMARY KEY,
+            address  TEXT NOT NULL
+        )
+    """)
     # Migration: add paused column to databases created before this version.
     # ALTER TABLE raises OperationalError if the column already exists — swallow it.
     try:
@@ -110,6 +116,33 @@ def db_init():
         pass
     conn.commit()
     conn.close()
+
+
+def db_get_personal_wallet(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute("SELECT address FROM personal_wallets WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def db_set_personal_wallet(user_id, address):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        INSERT INTO personal_wallets (user_id, address) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET address=excluded.address
+    """, (user_id, address))
+    conn.commit()
+    conn.close()
+
+
+def db_remove_personal_wallet(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.execute("DELETE FROM personal_wallets WHERE user_id=?", (user_id,))
+    conn.commit()
+    removed = cur.rowcount > 0
+    conn.close()
+    return removed
+
 
 
 
@@ -264,16 +297,16 @@ def check_rug(mint):
     try:
         data = base64.b64decode(value["data"][0])
     except Exception:
-        return ("UNKNOWN", 0, ["rpc error"])
+        return ("UNKNOWN", 0, ["data unavailable"])
 
     if len(data) < 82:
-        return ("UNKNOWN", 0, ["rpc error"])
+        return ("UNKNOWN", 0, ["data unavailable"])
 
     # Step 2: classic authorities.
     try:
         has_mint_auth, has_freeze_auth = parse_mint_account(data)
     except Exception:
-        return ("UNKNOWN", 0, ["rpc error"])
+        return ("UNKNOWN", 0, ["data unavailable"])
 
     if has_mint_auth:
         score -= 30
@@ -358,7 +391,7 @@ def check_rug(mint):
 # --- Telegram handlers ------------------------------------------------------
 
 BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
-ASK_ADDRESS, ASK_NAME = range(2)
+ASK_ADDRESS, ASK_NAME, ASK_IMPORT_ADDR = range(3)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -366,24 +399,157 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 <b>Solana Wallet Watcher</b>\n\n"
         "I monitor Solana wallets in real time and alert you when they buy "
-        "or sell tokens, complete with real-time wallet balance and an on-chain safety score.\n\n"
+        "or sell tokens, complete with live wallet balance and an on-chain safety score.\n\n"
         "<b>Commands:</b>\n"
+        "• /my_wallet — View or connect your personal wallet\n"
+        "• /import_wallet — Connect/update your personal wallet\n"
         "• /new_watch — Add a wallet to watch (max 10)\n"
         "• /my_watches — List your tracked wallets\n"
         "• /pause_watch — Pause or resume watching a wallet\n"
-        "• /remove_watch — Remove a wallet\n"
-        "• /status — Bot health and monitor state\n"
+        "• /remove_watch — Remove a watched wallet\n"
         "• /cancel — Abort the current operation"
     )
     await update.effective_message.reply_text(text, parse_mode="HTML")
     return ConversationHandler.END
 
 
+# --- Personal Wallet Feature -----------------------------------------------
+
+async def cmd_my_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the user's personal wallet with live SOL balance and token count."""
+    user_id = update.effective_user.id
+    addr = db_get_personal_wallet(user_id)
+    if not addr:
+        buttons = InlineKeyboardMarkup([[
+            InlineKeyboardButton("➕ Connect My Wallet", callback_data="wal:import"),
+        ]])
+        await update.effective_message.reply_text(
+            "💼 <b>Personal Wallet</b>\n\n"
+            "You haven't connected your personal wallet yet.\n"
+            "Connect your wallet to view your balance, tokens, and quick links anytime.\n\n"
+            "Tap below or send /import_wallet to connect.",
+            parse_mode="HTML",
+            reply_markup=buttons,
+        )
+        return
+
+    sol = await asyncio.to_thread(get_sol_balance, addr)
+    sol_str = f"{sol:.4f} SOL" if sol is not None else "unavailable"
+    mints = await asyncio.to_thread(fetch_wallet_mints, addr)
+    token_count = len(mints) if mints is not None else "unavailable"
+
+    buttons = [
+        [
+            InlineKeyboardButton("🔍 Birdeye", url=f"https://birdeye.so/profile/{addr}?chain=solana"),
+            InlineKeyboardButton("🌐 Solscan", url=f"https://solscan.io/account/{addr}"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Change Wallet", callback_data="wal:import"),
+            InlineKeyboardButton("🗑 Disconnect", callback_data="wal:disconnect"),
+        ],
+    ]
+    await update.effective_message.reply_text(
+        "💼 <b>My Personal Wallet</b>\n\n"
+        f"Address: <code>{addr}</code>\n"
+        f"SOL Balance: <b>{sol_str}</b>\n"
+        f"Tokens Held: <b>{token_count}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_import_wallet_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for /import_wallet or /add_wallet."""
+    user_id = update.effective_user.id
+
+    if context.args and len(context.args) > 0:
+        addr = context.args[0].strip()
+        if (32 <= len(addr) <= 44) and all(c in BASE58_ALPHABET for c in addr):
+            db_set_personal_wallet(user_id, addr)
+            sol = await asyncio.to_thread(get_sol_balance, addr)
+            sol_str = f"{sol:.4f} SOL" if sol is not None else "unavailable"
+            mints = await asyncio.to_thread(fetch_wallet_mints, addr)
+            token_count = len(mints) if mints is not None else "unavailable"
+            await update.effective_message.reply_text(
+                "✅ <b>Personal Wallet Connected!</b>\n\n"
+                f"Address: <code>{addr}</code>\n"
+                f"SOL Balance: <b>{sol_str}</b>\n"
+                f"Tokens Held: <b>{token_count}</b>\n\n"
+                "Use /my_wallet anytime to view your portfolio.",
+                parse_mode="HTML",
+            )
+            return ConversationHandler.END
+        else:
+            await update.effective_message.reply_text(
+                "That does not look like a valid Solana address. Try again or /cancel."
+            )
+            return ASK_IMPORT_ADDR
+
+    await update.effective_message.reply_text(
+        "💼 <b>Connect Your Personal Wallet</b>\n\n"
+        "Send your Solana wallet address:\n"
+        "<i>(We will never ask for private keys or seed phrases — only your public address)</i>",
+        parse_mode="HTML",
+    )
+    return ASK_IMPORT_ADDR
+
+
+async def recv_import_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    addr = update.effective_message.text.strip()
+    if not (32 <= len(addr) <= 44) or not all(c in BASE58_ALPHABET for c in addr):
+        await update.effective_message.reply_text(
+            "That does not look like a Solana address. Try again or /cancel."
+        )
+        return ASK_IMPORT_ADDR
+
+    user_id = update.effective_user.id
+    db_set_personal_wallet(user_id, addr)
+    sol = await asyncio.to_thread(get_sol_balance, addr)
+    sol_str = f"{sol:.4f} SOL" if sol is not None else "unavailable"
+    mints = await asyncio.to_thread(fetch_wallet_mints, addr)
+    token_count = len(mints) if mints is not None else "unavailable"
+
+    await update.effective_message.reply_text(
+        "✅ <b>Personal Wallet Connected!</b>\n\n"
+        f"Address: <code>{addr}</code>\n"
+        f"SOL Balance: <b>{sol_str}</b>\n"
+        f"Tokens Held: <b>{token_count}</b>\n\n"
+        "Use /my_wallet anytime to view your balance and portfolio.",
+        parse_mode="HTML",
+    )
+    return ConversationHandler.END
+
+
+async def on_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data or ""
+    await query.answer()
+
+    if data == "wal:disconnect":
+        db_remove_personal_wallet(user_id)
+        await query.edit_message_text(
+            "🗑 <b>Personal wallet disconnected.</b>\nUse /import_wallet anytime to connect a new wallet.",
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "wal:import":
+        await query.edit_message_text(
+            "💼 <b>Connect Your Personal Wallet</b>\n\n"
+            "Send your address using /import_wallet &lt;address&gt; or tap below to start:\n"
+            "👉 Send: <code>/import_wallet YOUR_ADDRESS</code>",
+            parse_mode="HTML",
+        )
+        return
+
+
+# --- Watched Wallets --------------------------------------------------------
+
 async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # Enforce the cap at the entry point, not mid-conversation — a user
-    # should not get blocked after they have already typed an address.
     if db_count(user_id) >= MAX_WALLETS:
         await update.effective_message.reply_text(
             f"You already track {MAX_WALLETS} wallets. Remove one with /remove_watch first."
@@ -396,10 +562,7 @@ async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def recv_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Use effective_message throughout — works in DM, groups, and forwarded updates.
     addr = update.effective_message.text.strip()
-    # Shallow validation only — 32-44 base58 chars. The RPC finds nothing
-    # if the address is wrong; we do not verify the checksum here.
     if not (32 <= len(addr) <= 44) or not all(c in BASE58_ALPHABET for c in addr):
         await update.effective_message.reply_text(
             "That does not look like a Solana address. Try again or /cancel."
@@ -411,11 +574,6 @@ async def recv_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Analysis: after the wallet is saved, fetch its current tokens and seed
-    # the baseline right here. This proves the Helius key works and the wallet
-    # is readable at the moment the user adds it. If the RPC fails here, the
-    # user is told now, instead of silently watching nothing until they happen
-    # to run /status.
     name = update.effective_message.text.strip()
     if not name or len(name) > 32:
         await update.effective_message.reply_text(
@@ -438,18 +596,14 @@ async def recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Try a different name or /cancel.",
             parse_mode="HTML",
         )
-        # Return to ASK_NAME so the user can pick a different name without
-        # restarting the whole flow.
         return ASK_NAME
 
-    # Seed the baseline immediately so the first real purchase triggers an alert,
-    # not a false-positive dump of every token the wallet already holds.
     mints = await asyncio.to_thread(fetch_wallet_mints, addr)
     if mints is None:
         await update.effective_message.reply_text(
             f"Saved <b>{html.escape(name)}</b> → <code>{addr}</code>\n\n"
-            "⚠️ Could not read this wallet from Helius right now. "
-            "The monitor will retry every 15 s. Use /status to check RPC health.",
+            "⚠️ Could not verify this wallet on-chain right now. "
+            "The bot will automatically connect and verify on the next cycle.",
             parse_mode="HTML",
         )
     else:
@@ -478,7 +632,7 @@ async def cmd_my_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.effective_message.reply_text("No wallets tracked. Use /new_watch.")
         return
-    lines = [f"<b>Your wallets</b> ({len(rows)}/{MAX_WALLETS})"]
+    lines = [f"<b>Your watched wallets</b> ({len(rows)}/{MAX_WALLETS})"]
     for name, addr, paused in rows:
         if paused:
             icon = "⏸"
@@ -490,55 +644,14 @@ async def cmd_my_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{icon} <code>{html.escape(name)}</code> — "
             f"<code>{addr[:4]}...{addr[-4:]}</code>"
         )
-    lines.append("\n🟢 active  🟡 baseline pending  ⏸ paused")
+    lines.append("\n🟢 active  🟡 verifying  ⏸ paused")
     await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Analysis: the only way to prove the monitor is alive from the user side.
-    # Shows DB counts, baseline count, last cycle stats, and Helius reachability.
-    user_id = update.effective_user.id
-    my_wallets = db_count(user_id)
-    all_rows = db_all_wallets()
-    total_wallets = len(all_rows)
-    paused_count = sum(1 for _, _, _, p in all_rows if p)
-    active_baselines = len(baselines)
+    """Redirect to user wallets list cleanly without exposing internal server metrics."""
+    await cmd_my_watches(update, context)
 
-    if state["last_cycle_ts"] == 0:
-        cycle_line = "Never run yet (waiting on first 15 s tick)."
-    else:
-        ago = int(time.time() - state["last_cycle_ts"])
-        cycle_line = (
-            f"{ago}s ago · {state['last_cycle_ms']}ms · "
-            f"{state['last_cycle_wallets']} wallets · "
-            f"{state['last_cycle_new']} buys · "
-            f"{state.get('last_cycle_sells', 0)} sells · "
-            f"{state['last_cycle_failures']} failures"
-        )
-
-    if state["last_rpc_ok"] is None:
-        rpc_line = "not attempted yet"
-    elif state["last_rpc_ok"]:
-        rpc_line = "✅ last RPC succeeded"
-    else:
-        rpc_line = "❌ last RPC failed (check HELIUS_KEY)"
-
-    uptime_s = int(time.time() - state["started_at"])
-    h, rem = divmod(uptime_s, 3600)
-    m, s = divmod(rem, 60)
-    uptime_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
-
-    text = (
-        "<b>Bot Status</b>\n"
-        f"⏱ Uptime: {uptime_str}\n"
-        f"👛 Your wallets: {my_wallets}/{MAX_WALLETS}\n"
-        f"🌐 Total wallets (all users): {total_wallets} ({paused_count} paused)\n"
-        f"📡 Active baselines: {active_baselines}\n"
-        f"🔄 Last cycle: {cycle_line}\n"
-        f"☁️ Helius: {rpc_line}\n"
-        f"⏰ Poll interval: {POLL_INTERVAL}s"
-    )
-    await update.effective_message.reply_text(text, parse_mode="HTML")
 
 
 # --- Pause / Resume flow (callback-based) -----------------------------------
@@ -777,7 +890,7 @@ async def send_verdict(app, user_id, mint):
         verdict, score, risks = await asyncio.to_thread(check_rug, mint)
     except Exception as e:
         log.error("check_rug crashed for %s: %s", mint, e)
-        verdict, score, risks = ("UNKNOWN", 0, ["rpc error"])
+        verdict, score, risks = ("UNKNOWN", 0, ["data unavailable"])
 
     emoji = {"SAFE": "✅", "WARN": "⚠️", "DANGER": "🔴", "UNKNOWN": "❓"}.get(verdict, "❓")
     risk_text = (
@@ -911,13 +1024,14 @@ async def monitor_loop(app):
 async def post_init(app):
     try:
         await app.bot.set_my_commands([
-            BotCommand("start",        "Introduce bot and show commands"),
-            BotCommand("new_watch",    "Watch a Solana wallet (up to 10)"),
-            BotCommand("my_watches",   "List tracked wallets"),
-            BotCommand("pause_watch",  "Pause or resume a wallet"),
-            BotCommand("remove_watch", "Remove a watched wallet"),
-            BotCommand("status",       "Bot health and monitor state"),
-            BotCommand("cancel",       "Cancel current operation"),
+            BotCommand("start",          "Introduce bot and show commands"),
+            BotCommand("my_wallet",      "View or connect your personal wallet"),
+            BotCommand("import_wallet",  "Connect or update your personal wallet"),
+            BotCommand("new_watch",      "Watch a Solana wallet (up to 10)"),
+            BotCommand("my_watches",     "List tracked wallets"),
+            BotCommand("pause_watch",    "Pause or resume watching a wallet"),
+            BotCommand("remove_watch",   "Remove a watched wallet"),
+            BotCommand("cancel",         "Cancel current operation"),
         ])
         log.info("Bot commands registered")
     except Exception as e:
@@ -951,10 +1065,27 @@ def main():
         .build()
     )
 
+    # ConversationHandler for importing a personal wallet
+    import_wallet_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler(["import_wallet", "importwallet", "add_wallet", "addwallet"], cmd_import_wallet_entry),
+        ],
+        states={
+            ASK_IMPORT_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_import_address)],
+        },
+        fallbacks=[
+            CommandHandler("cancel",                         cmd_cancel),
+            CommandHandler(["start", "help"],                cmd_start),
+            CommandHandler(["my_wallet", "mywallet"],        cmd_my_wallet),
+            CommandHandler(["my_watches", "mywatches"],      cmd_my_watches),
+            CommandHandler(["new_watch", "newwatch"],        cmd_new_watch),
+            CommandHandler(["pause_watch", "pausewatch"],    cmd_pause_watch),
+            CommandHandler(["remove_watch", "removewatch"],  cmd_remove_watch),
+        ],
+        allow_reentry=True,
+    )
+
     # ConversationHandler for the /new_watch multi-step flow.
-    # fallbacks list every top-level command so that if a user is stuck in
-    # ASK_ADDRESS or ASK_NAME and types another command, that command executes
-    # cleanly instead of being silently dropped by ~filters.COMMAND.
     new_watch = ConversationHandler(
         entry_points=[CommandHandler(["new_watch", "newwatch"], cmd_new_watch)],
         states={
@@ -964,20 +1095,24 @@ def main():
         fallbacks=[
             CommandHandler("cancel",                         cmd_cancel),
             CommandHandler(["start", "help"],                cmd_start),
+            CommandHandler(["my_wallet", "mywallet"],        cmd_my_wallet),
+            CommandHandler(["import_wallet", "importwallet", "add_wallet", "addwallet"], cmd_import_wallet_entry),
             CommandHandler(["my_watches", "mywatches"],      cmd_my_watches),
             CommandHandler(["pause_watch", "pausewatch"],    cmd_pause_watch),
             CommandHandler(["remove_watch", "removewatch"],  cmd_remove_watch),
-            CommandHandler("status",                         cmd_status),
         ],
         allow_reentry=True,
     )
 
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
+    application.add_handler(CommandHandler(["my_wallet", "mywallet", "wallet"], cmd_my_wallet))
+    application.add_handler(import_wallet_conv)
     application.add_handler(new_watch)
     application.add_handler(CommandHandler(["my_watches", "mywatches"], cmd_my_watches))
     application.add_handler(CommandHandler(["pause_watch", "pausewatch"], cmd_pause_watch))
     application.add_handler(CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch))
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CallbackQueryHandler(on_wallet_callback, pattern=r"^wal:"))
     application.add_handler(CallbackQueryHandler(on_remove_callback, pattern=r"^rm:"))
     application.add_handler(CallbackQueryHandler(on_pause_callback, pattern=r"^pg:"))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
@@ -991,4 +1126,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
