@@ -1,4 +1,4 @@
-# bot.py
+﻿# bot.py
 import os
 import asyncio
 import sqlite3
@@ -6,6 +6,7 @@ import base64
 import struct
 import logging
 import html
+import time
 from dotenv import load_dotenv
 import requests
 
@@ -33,6 +34,23 @@ DB_FILE = os.getenv("DB_FILE", "wallets.db")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("watcher")
+
+
+# --- Bot state (for /status) ------------------------------------------------
+# Analysis: the monitor is invisible from the outside. These globals expose
+# just enough for /status to prove the loop is alive and Helius is reachable.
+# Written by the monitor loop, read by /status. Both run on the same asyncio
+# loop, so no locking is needed.
+
+state = {
+    "last_cycle_ts": 0.0,
+    "last_cycle_ms": 0,
+    "last_cycle_wallets": 0,
+    "last_cycle_new": 0,
+    "last_cycle_failures": 0,
+    "last_rpc_ok": None,
+    "started_at": time.time(),
+}
 
 
 def start_health_server():
@@ -66,9 +84,8 @@ def start_health_server():
         log.warning(f"Could not start health check server on port {port_str}: {e}")
 
 
-
 # --- Database ---------------------------------------------------------------
-# Keyed by (user_id, name) so one user can't have two wallets called "main"
+# Keyed by (user_id, name) so one user cannot have two wallets called "main"
 # but two users can each have their own.
 
 def db_init():
@@ -135,14 +152,18 @@ def db_all_wallets():
 
 # --- RPC --------------------------------------------------------------------
 # Single choke point. Any failure collapses to None. No retries — the next
-# poll is 15s away and retries inside a cycle cause pile-ups.
+# poll is 15s away and retries inside a cycle cause pile-ups. Records success
+# or failure in `state` so /status can tell the user whether Helius is reachable.
 
 def rpc(method, params):
     body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     try:
         r = requests.post(RPC_URL, json=body, timeout=10)
-        return r.json().get("result")
+        result = r.json().get("result")
+        state["last_rpc_ok"] = True
+        return result
     except Exception as e:
+        state["last_rpc_ok"] = False
         log.warning("rpc %s failed: %s", method, e)
         return None
 
@@ -187,11 +208,11 @@ def parse_token2022_extensions(data):
 # Analysis: static reads only. Never signs, never simulates, never touches a
 # stateful endpoint. Score starts at 100, drops per red flag.
 #
-# Deliberately NOT here, because each needs a service we don't use:
+# Deliberately NOT here, because each needs a service we do not use:
 #   - Liquidity depth (DEX API)
 #   - Bundle / sniper detection (historical tx analysis)
 #   - Holder wallet reputation (label service)
-# Anything we can't prove with Helius RPC alone is reported as WARN, not SAFE.
+# Anything we cannot prove with Helius RPC alone is reported as WARN, not SAFE.
 
 def check_rug(mint):
     score = 100
@@ -258,7 +279,7 @@ def check_rug(mint):
                     risks.append(f"Transfer fee {newer_bps / 100:.2f}%")
 
     # Step 4: top-10 holder concentration vs. total supply.
-    # Snapshot only. Isolated try/except so a bad response here doesn't
+    # Snapshot only. Isolated try/except so a bad response here does not
     # invalidate the authority checks above.
     try:
         supply_res = rpc("getTokenSupply", [mint])
@@ -309,27 +330,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 <b>Solana Wallet Watcher</b>\n\n"
         "I monitor Solana wallets in real time and alert you when they buy "
-        "or receive new tokens, complete with an on-chain safety score.\n\n"
+        "or receive new tokens — complete with an on-chain safety score.\n\n"
         "<b>Commands:</b>\n"
         "• /new_watch — Add a wallet to watch (max 10)\n"
         "• /my_watches — List your tracked wallets\n"
         "• /remove_watch — Remove a wallet (pick from list)\n"
+        "• /status — Bot health and monitor state\n"
         "• /cancel — Abort the current operation"
     )
-    try:
-        if update.effective_message:
-            await update.effective_message.reply_text(text, parse_mode="HTML")
-    except Exception as e:
-        log.warning("cmd_start HTML reply failed: %s", e)
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "Solana Wallet Watcher\n\n"
-                "Commands:\n"
-                "/new_watch - Add a wallet to watch (max 10)\n"
-                "/my_watches - List your tracked wallets\n"
-                "/remove_watch - Remove a wallet\n"
-                "/cancel - Abort the current operation"
-            )
+    await update.effective_message.reply_text(text, parse_mode="HTML")
     return ConversationHandler.END
 
 
@@ -337,59 +346,92 @@ async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     # Enforce the cap at the entry point, not mid-conversation — a user
-    # shouldn't get blocked after they've already typed an address.
+    # should not get blocked after they have already typed an address.
     if db_count(user_id) >= MAX_WALLETS:
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                f"You already track {MAX_WALLETS} wallets. Remove one with /remove_watch first."
-            )
+        await update.effective_message.reply_text(
+            f"You already track {MAX_WALLETS} wallets. Remove one with /remove_watch first."
+        )
         return ConversationHandler.END
 
     context.user_data.clear()
-    if update.effective_message:
-        await update.effective_message.reply_text("Send the Solana wallet address to watch:")
+    await update.effective_message.reply_text("Send the Solana wallet address to watch:")
     return ASK_ADDRESS
 
 
 async def recv_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    addr = update.message.text.strip()
+    # Use effective_message throughout — works in DM, groups, and forwarded updates.
+    addr = update.effective_message.text.strip()
     # Shallow validation only — 32-44 base58 chars. The RPC finds nothing
-    # if the address is wrong; we don't verify the checksum here.
+    # if the address is wrong; we do not verify the checksum here.
     if not (32 <= len(addr) <= 44) or not all(c in BASE58_ALPHABET for c in addr):
-        await update.message.reply_text("That doesn't look like a Solana address. Try again or /cancel.")
+        await update.effective_message.reply_text(
+            "That does not look like a Solana address. Try again or /cancel."
+        )
         return ASK_ADDRESS
     context.user_data["address"] = addr
-    await update.message.reply_text("Give this wallet a short name:")
+    await update.effective_message.reply_text("Give this wallet a short name:")
     return ASK_NAME
 
 
 async def recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
+    # Analysis: after the wallet is saved, fetch its current tokens and seed
+    # the baseline right here. This proves the Helius key works and the wallet
+    # is readable at the moment the user adds it. If the RPC fails here, the
+    # user is told now, instead of silently watching nothing until they happen
+    # to run /status.
+    name = update.effective_message.text.strip()
     if not name or len(name) > 32:
-        await update.message.reply_text("Name must be 1-32 characters. Try again or /cancel.")
+        await update.effective_message.reply_text(
+            "Name must be 1-32 characters. Try again or /cancel."
+        )
         return ASK_NAME
 
     user_id = update.effective_user.id
     addr = context.user_data.get("address")
     if not addr:
-        await update.message.reply_text("Something went wrong. Start over with /new_watch.")
+        await update.effective_message.reply_text(
+            "Something went wrong. Start over with /new_watch."
+        )
         context.user_data.clear()
         return ConversationHandler.END
 
     if not db_add(user_id, name, addr):
-        await update.message.reply_text(f"You already have a wallet named '{name}'.")
-        context.user_data.clear()
-        return ConversationHandler.END
+        await update.effective_message.reply_text(
+            f"You already have a wallet named <b>{html.escape(name)}</b>. "
+            "Try a different name or /cancel.",
+            parse_mode="HTML",
+        )
+        # Return to ASK_NAME so the user can pick a different name without
+        # restarting the whole flow.
+        return ASK_NAME
 
-    await update.message.reply_text(f"Watching '{name}' → {addr}")
+    # Seed the baseline immediately so the first real purchase triggers an alert,
+    # not a false-positive dump of every token the wallet already holds.
+    mints = await asyncio.to_thread(fetch_wallet_mints, addr)
+    if mints is None:
+        await update.effective_message.reply_text(
+            f"Saved <b>{html.escape(name)}</b> → <code>{addr}</code>\n\n"
+            "⚠️ Could not read this wallet from Helius right now. "
+            "The monitor will retry every 15 s. Use /status to check RPC health.",
+            parse_mode="HTML",
+        )
+    else:
+        baselines[(user_id, addr)] = mints
+        await update.effective_message.reply_text(
+            f"✅ Now watching <b>{html.escape(name)}</b>\n"
+            f"<code>{addr}</code>\n\n"
+            f"Baseline: <b>{len(mints)}</b> token(s) currently held.\n"
+            "I will alert you the moment a new token appears.",
+            parse_mode="HTML",
+        )
+
     context.user_data.clear()
     return ConversationHandler.END
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    if update.effective_message:
-        await update.effective_message.reply_text("Cancelled.")
+    await update.effective_message.reply_text("Cancelled.")
     return ConversationHandler.END
 
 
@@ -397,30 +439,68 @@ async def cmd_my_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = db_list(user_id)
     if not rows:
-        if update.effective_message:
-            await update.effective_message.reply_text("No wallets tracked. Use /new_watch.")
-        return ConversationHandler.END
+        await update.effective_message.reply_text("No wallets tracked. Use /new_watch.")
+        return
     lines = [f"<b>Your wallets</b> ({len(rows)}/{MAX_WALLETS})"]
     for name, addr in rows:
-        lines.append(f"• <code>{html.escape(name)}</code> — <code>{addr[:4]}...{addr[-4:]}</code>")
-    try:
-        if update.effective_message:
-            await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
-    except Exception as e:
-        log.warning("cmd_my_watches HTML failed: %s", e)
-        if update.effective_message:
-            plain_lines = [f"Your wallets ({len(rows)}/{MAX_WALLETS})"]
-            for name, addr in rows:
-                plain_lines.append(f"• {name} - {addr[:4]}...{addr[-4:]}")
-            await update.effective_message.reply_text("\n".join(plain_lines))
-    return ConversationHandler.END
+        seeded = "🟢" if (user_id, addr) in baselines else "🟡"
+        lines.append(
+            f"{seeded} <code>{html.escape(name)}</code> — "
+            f"<code>{addr[:4]}...{addr[-4:]}</code>"
+        )
+    lines.append("\n🟢 = monitoring active  🟡 = baseline pending (next poll)")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Analysis: the only way to prove the monitor is alive from the user side.
+    # Shows DB counts, baseline count, last cycle stats, and Helius reachability.
+    user_id = update.effective_user.id
+    my_wallets = db_count(user_id)
+    total_wallets = len(db_all_wallets())
+    active_baselines = len(baselines)
+
+    if state["last_cycle_ts"] == 0:
+        cycle_line = "Never run yet (waiting on first 15 s tick)."
+    else:
+        ago = int(time.time() - state["last_cycle_ts"])
+        cycle_line = (
+            f"{ago}s ago · {state['last_cycle_ms']}ms · "
+            f"{state['last_cycle_wallets']} wallets · "
+            f"{state['last_cycle_new']} new · "
+            f"{state['last_cycle_failures']} failures"
+        )
+
+    if state["last_rpc_ok"] is None:
+        rpc_line = "not attempted yet"
+    elif state["last_rpc_ok"]:
+        rpc_line = "✅ last RPC succeeded"
+    else:
+        rpc_line = "❌ last RPC failed (check HELIUS_KEY)"
+
+    uptime_s = int(time.time() - state["started_at"])
+    h, rem = divmod(uptime_s, 3600)
+    m, s = divmod(rem, 60)
+    uptime_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+
+    text = (
+        "<b>Bot Status</b>\n"
+        f"⏱ Uptime: {uptime_str}\n"
+        f"👛 Your wallets: {my_wallets}/{MAX_WALLETS}\n"
+        f"🌐 Total wallets (all users): {total_wallets}\n"
+        f"📡 Active baselines: {active_baselines}\n"
+        f"🔄 Last cycle: {cycle_line}\n"
+        f"☁️ Helius: {rpc_line}\n"
+        f"⏰ Poll interval: {POLL_INTERVAL}s"
+    )
+    await update.effective_message.reply_text(text, parse_mode="HTML")
 
 
 # --- Remove flow (callback-based, no argument needed) -----------------------
-# Analysis: /remove_watch takes no argument now. It renders the user's wallets
-# as a vertical inline keyboard. Tapping a wallet edits the same message into
-# a Confirm / Cancel pair, so the conversation stays on one message and there
-# is no drift between "the list I saw" and "the wallet I meant".
+# Analysis: /remove_watch takes no argument. It renders the user's wallets as
+# a vertical inline keyboard. Tapping a wallet edits the same message into a
+# Confirm / Cancel pair, so the conversation stays on one message and there is
+# no drift between "the list I saw" and "the wallet I meant".
 #
 # Callback payload format:
 #   rm:pick:<name>   -> user tapped a wallet, show confirm
@@ -432,22 +512,22 @@ async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = db_list(user_id)
 
     if not rows:
-        if update.effective_message:
-            await update.effective_message.reply_text("No wallets tracked. Use /new_watch first.")
-        return ConversationHandler.END
+        await update.effective_message.reply_text("No wallets tracked. Use /new_watch first.")
+        return
 
     buttons = [
-        [InlineKeyboardButton(f"🗑 {name}  ({addr[:4]}...{addr[-4:]})", callback_data=f"rm:pick:{name}")]
+        [InlineKeyboardButton(
+            f"🗑 {name}  ({addr[:4]}...{addr[-4:]})",
+            callback_data=f"rm:pick:{name}"
+        )]
         for name, addr in rows
     ]
     keyboard = InlineKeyboardMarkup(buttons)
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            "<b>Which wallet do you want to remove?</b>",
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-    return ConversationHandler.END
+    await update.effective_message.reply_text(
+        "<b>Which wallet do you want to remove?</b>",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
 
 
 async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -455,8 +535,7 @@ async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = query.from_user.id
     data = query.data or ""
 
-    # Any tap here acknowledges the button, otherwise Telegram shows a
-    # spinner on the button for ~15s.
+    # Acknowledge the tap, otherwise Telegram shows a spinner on the button.
     await query.answer()
 
     parts = data.split(":", 2)
@@ -464,12 +543,12 @@ async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # --- Pick: user chose a wallet from the list ---
     if len(parts) == 3 and parts[0] == "rm" and parts[1] == "pick":
         name = parts[2]
-        # The wallet may have been removed by /new_watch overwrite or another
-        # session. Re-check before showing confirm.
+        # The wallet may have been removed by another session. Re-check
+        # before showing confirm.
         existing = dict(db_list(user_id))
         if name not in existing:
             await query.edit_message_text(
-                f"Wallet '{html.escape(name)}' is no longer tracked.",
+                f"Wallet <b>{html.escape(name)}</b> is no longer tracked.",
                 parse_mode="HTML",
             )
             return
@@ -489,21 +568,20 @@ async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # --- Yes: user confirmed ---
     if len(parts) == 3 and parts[0] == "rm" and parts[1] == "yes":
         name = parts[2]
+        # Read addr BEFORE deleting so we can pop the baseline cleanly.
         existing = dict(db_list(user_id))
         addr = existing.get(name)
         removed = db_remove(user_id, name)
         if removed:
-            # Also drop the baseline immediately so the wallet won't be re-scanned.
             if addr:
                 baselines.pop((user_id, addr), None)
-
             await query.edit_message_text(
-                f"✅ Removed '<b>{html.escape(name)}</b>'.",
+                f"✅ Removed <b>{html.escape(name)}</b>.",
                 parse_mode="HTML",
             )
         else:
             await query.edit_message_text(
-                f"Wallet '<b>{html.escape(name)}</b>' was already gone.",
+                f"Wallet <b>{html.escape(name)}</b> was already gone.",
                 parse_mode="HTML",
             )
         return
@@ -532,20 +610,28 @@ baselines = {}
 def fetch_wallet_mints(address):
     # Returns None on RPC failure so the caller can tell "empty wallet" apart
     # from "request failed". The two must not be conflated in the monitor.
-    res = rpc("getTokenAccountsByOwner", [
-        address,
-        {"programId": TOKEN_PROGRAM},
-        {"encoding": "jsonParsed"},
-    ])
-    if not res:
-        return None
+    # Queries BOTH TOKEN_PROGRAM and TOKEN_2022_PROGRAM so Token-2022 purchases
+    # (e.g. pump.fun tokens launched post-migration) are detected too.
     mints = set()
-    for item in res.get("value", []):
-        try:
-            info = item["account"]["data"]["parsed"]["info"]
-            mints.add(info["mint"])
-        except (KeyError, TypeError):
-            continue
+
+    for program_id in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
+        res = rpc("getTokenAccountsByOwner", [
+            address,
+            {"programId": program_id},
+            {"encoding": "jsonParsed"},
+        ])
+        if res is None:
+            # If either side fails, treat the whole call as failed.
+            # This prevents a partial baseline that would silently miss one
+            # token program and corrupt the diff on the next cycle.
+            return None
+        for item in res.get("value", []):
+            try:
+                info = item["account"]["data"]["parsed"]["info"]
+                mints.add(info["mint"])
+            except (KeyError, TypeError):
+                continue
+
     return mints
 
 
@@ -553,7 +639,11 @@ async def send_alert(app, user_id, name, mint):
     try:
         await app.bot.send_message(
             chat_id=user_id,
-            text=f"🚨 <b>{html.escape(name)}</b> bought\nCA: <code>{mint}</code>\n<i>scanning chain...</i>",
+            text=(
+                f"🚨 <b>{html.escape(name)}</b> just bought a token!\n"
+                f"CA: <code>{mint}</code>\n"
+                f"<i>Scanning chain for risks...</i>"
+            ),
             parse_mode="HTML",
         )
     except Exception as e:
@@ -569,18 +659,26 @@ async def send_verdict(app, user_id, mint):
         verdict, score, risks = ("UNKNOWN", 0, ["rpc error"])
 
     emoji = {"SAFE": "✅", "WARN": "⚠️", "DANGER": "🔴", "UNKNOWN": "❓"}.get(verdict, "❓")
-    risk_text = "\n".join(f"• {html.escape(r)}" for r in risks) if risks else "No structural red flags"
+    risk_text = (
+        "\n".join(f"• {html.escape(r)}" for r in risks)
+        if risks
+        else "No structural red flags found."
+    )
     text = (
-        f"{emoji} <b>{verdict}</b> — safety {score}/100\n"
-        f"CA: <code>{mint}</code>\n"
+        f"{emoji} <b>{verdict}</b> — safety score {score}/100\n"
+        f"CA: <code>{mint}</code>\n\n"
         f"{risk_text}"
     )
 
-    # Deep link only — the user signs in their own wallet. The bot never
+    # Deep links only — the user signs in their own wallet. The bot never
     # touches a private key, so there is nothing to compromise here.
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
-            "Trade on Jupiter",
+            "🔍 Birdeye",
+            url=f"https://birdeye.so/token/{mint}",
+        ),
+        InlineKeyboardButton(
+            "⚡ Trade on Jupiter",
             url=f"https://jup.ag/swap/SOL-{mint}",
         ),
     ]])
@@ -600,8 +698,14 @@ async def send_verdict(app, user_id, mint):
 async def monitor_loop(app):
     log.info("monitor loop started")
     while True:
+        cycle_start = time.time()
+        new_count = 0
+        fail_count = 0
+        wallet_count = 0
+
         try:
             wallets = db_all_wallets()
+            wallet_count = len(wallets)
             still_present = set()
 
             for user_id, name, address in wallets:
@@ -613,26 +717,33 @@ async def monitor_loop(app):
                 try:
                     mints = await asyncio.to_thread(fetch_wallet_mints, address)
                     if mints is None:
+                        fail_count += 1
                         # RPC failed. Skip WITHOUT overwriting the baseline —
                         # otherwise the failure looks like a full drain and
-                        # we'd re-alert on everything next poll.
+                        # we would re-alert on everything next poll.
                         continue
 
                     if key not in baselines:
                         baselines[key] = mints
-                        log.info("baseline set for %s/%s (%d mints)", user_id, name, len(mints))
+                        log.info(
+                            "baseline seeded for %s/%s (%d mints)",
+                            user_id, name, len(mints)
+                        )
                         continue
 
                     new_mints = mints - baselines[key]
                     if new_mints:
                         # Update baseline BEFORE awaiting sends, so a slow
-                        # Telegram call can't cause a re-alert next cycle.
+                        # Telegram call cannot cause a re-alert next cycle.
                         baselines[key] = mints
                         for mint in new_mints:
+                            new_count += 1
+                            log.info("new mint %s for %s (%s)", mint, name, user_id)
                             await send_alert(app, user_id, name, mint)
                             await send_verdict(app, user_id, mint)
 
                 except Exception as e:
+                    fail_count += 1
                     log.error("wallet %s (%s) processing failed: %s", name, address, e)
                     continue
 
@@ -644,6 +755,18 @@ async def monitor_loop(app):
         except Exception as e:
             log.error("monitor loop iteration failed: %s", e)
 
+        # Heartbeat + state for /status
+        cycle_ms = int((time.time() - cycle_start) * 1000)
+        state["last_cycle_ts"] = time.time()
+        state["last_cycle_ms"] = cycle_ms
+        state["last_cycle_wallets"] = wallet_count
+        state["last_cycle_new"] = new_count
+        state["last_cycle_failures"] = fail_count
+        log.info(
+            "poll: %d wallets, %d new, %d failures, %dms",
+            wallet_count, new_count, fail_count, cycle_ms,
+        )
+
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -652,11 +775,12 @@ async def monitor_loop(app):
 async def post_init(app):
     try:
         await app.bot.set_my_commands([
-            BotCommand("start", "Introduce bot and show commands"),
-            BotCommand("new_watch", "Watch a Solana wallet (up to 10)"),
-            BotCommand("my_watches", "List tracked wallets"),
+            BotCommand("start",        "Introduce bot and show commands"),
+            BotCommand("new_watch",    "Watch a Solana wallet (up to 10)"),
+            BotCommand("my_watches",   "List tracked wallets"),
             BotCommand("remove_watch", "Remove a watched wallet"),
-            BotCommand("cancel", "Cancel current operation"),
+            BotCommand("status",       "Bot health and monitor state"),
+            BotCommand("cancel",       "Cancel current operation"),
         ])
         log.info("Bot commands registered")
     except Exception as e:
@@ -668,7 +792,8 @@ def main():
     start_health_server()
     db_init()
 
-    # Ensure an active asyncio event loop exists on this thread (required for Python 3.12+ / 3.14)
+    # Ensure an active asyncio event loop exists on this thread
+    # (required for Python 3.12+ / 3.14 which removed implicit loop creation).
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
@@ -689,42 +814,38 @@ def main():
         .build()
     )
 
-    # /new_watch conversation handler with reentry and global fallbacks so
-    # user never gets trapped in an incomplete conversation.
+    # ConversationHandler for the /new_watch multi-step flow.
+    # fallbacks list every top-level command so that if a user is stuck in
+    # ASK_ADDRESS or ASK_NAME and types another command, that command executes
+    # cleanly instead of being silently dropped by ~filters.COMMAND.
     new_watch = ConversationHandler(
-        entry_points=[
-            CommandHandler(["new_watch", "newwatch"], cmd_new_watch),
-            MessageHandler(filters.Regex(r"^/(new_watch|newwatch)$"), cmd_new_watch),
-        ],
+        entry_points=[CommandHandler(["new_watch", "newwatch"], cmd_new_watch)],
         states={
             ASK_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_address)],
-            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_name)],
+            ASK_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_name)],
         },
         fallbacks=[
-            CommandHandler("cancel", cmd_cancel),
-            CommandHandler(["start", "help"], cmd_start),
-            CommandHandler(["my_watches", "mywatches"], cmd_my_watches),
-            CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch),
+            CommandHandler("cancel",                         cmd_cancel),
+            CommandHandler(["start", "help"],                cmd_start),
+            CommandHandler(["my_watches", "mywatches"],      cmd_my_watches),
+            CommandHandler(["remove_watch", "removewatch"],  cmd_remove_watch),
+            CommandHandler("status",                         cmd_status),
         ],
         allow_reentry=True,
     )
 
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
-    application.add_handler(MessageHandler(filters.Regex(r"^/(start|help)$"), cmd_start))
     application.add_handler(new_watch)
     application.add_handler(CommandHandler(["my_watches", "mywatches"], cmd_my_watches))
-    application.add_handler(MessageHandler(filters.Regex(r"^/(my_watches|mywatches)$"), cmd_my_watches))
     application.add_handler(CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch))
-    application.add_handler(MessageHandler(filters.Regex(r"^/(remove_watch|removewatch)$"), cmd_remove_watch))
-    # All inline-button taps from /remove_watch land here.
+    application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CallbackQueryHandler(on_remove_callback, pattern=r"^rm:"))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
-    application.add_handler(MessageHandler(filters.Regex(r"^/cancel$"), cmd_cancel))
     application.add_error_handler(on_error)
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+        drop_pending_updates=True,   # Do not replay stale messages after redeployment
     )
 
 
