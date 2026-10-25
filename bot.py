@@ -33,7 +33,20 @@ LAMPORTS_PER_SOL = 1_000_000_000
 
 MAX_WALLETS = 10
 POLL_INTERVAL = 15
-DB_FILE = os.getenv("DB_FILE", "wallets.db")
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+def resolve_db_path():
+    """Auto-detect persistent storage directory if on Render (/var/data, /data) or DB_FILE."""
+    env_file = os.getenv("DB_FILE")
+    if env_file:
+        return env_file
+    for candidate in ("/var/data", "/data"):
+        if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+            return os.path.join(candidate, "wallets.db")
+    return "wallets.db"
+
+DB_FILE = resolve_db_path()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("watcher")
@@ -91,64 +104,110 @@ def start_health_server():
 # --- Database ---------------------------------------------------------------
 # Keyed by (user_id, name) so one user cannot have two wallets called "main"
 # but two users can each have their own.
+#
+# Persistence:
+# 1. If DATABASE_URL is set (Neon, Supabase, Render Postgres), uses persistent cloud PostgreSQL.
+# 2. Otherwise uses SQLite, automatically storing in persistent mount (/var/data, /data, or $DB_FILE).
+
+def get_db():
+    """Returns (conn, is_pg) connected to PostgreSQL or SQLite."""
+    if DATABASE_URL and DATABASE_URL.startswith(("postgres://", "postgresql://")):
+        import psycopg2
+        url = DATABASE_URL
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        conn = psycopg2.connect(url)
+        return conn, True
+    else:
+        conn = sqlite3.connect(DB_FILE)
+        return conn, False
+
 
 def db_init():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS wallets (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id  INTEGER NOT NULL,
-            name     TEXT    NOT NULL,
-            address  TEXT    NOT NULL,
-            paused   INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(user_id, name)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS personal_wallets (
-            user_id  INTEGER PRIMARY KEY,
-            address  TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS trading_wallets (
-            user_id     INTEGER PRIMARY KEY,
-            address     TEXT NOT NULL,
-            private_key TEXT NOT NULL
-        )
-    """)
-    # Migration: add paused column to databases created before this version.
-    # ALTER TABLE raises OperationalError if the column already exists — swallow it.
-    try:
-        conn.execute("ALTER TABLE wallets ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
+    conn, is_pg = get_db()
+    cur = conn.cursor()
+    if is_pg:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                id       SERIAL PRIMARY KEY,
+                user_id  BIGINT NOT NULL,
+                name     TEXT   NOT NULL,
+                address  TEXT   NOT NULL,
+                paused   INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, name)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trading_wallets (
+                user_id     BIGINT PRIMARY KEY,
+                address     TEXT NOT NULL,
+                private_key TEXT NOT NULL
+            )
+        """)
+        log.info("Database initialized: connected to persistent PostgreSQL")
+    else:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id  INTEGER NOT NULL,
+                name     TEXT    NOT NULL,
+                address  TEXT    NOT NULL,
+                paused   INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, name)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trading_wallets (
+                user_id     INTEGER PRIMARY KEY,
+                address     TEXT NOT NULL,
+                private_key TEXT NOT NULL
+            )
+        """)
+        try:
+            cur.execute("ALTER TABLE wallets ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        log.info("Database initialized: using SQLite at %s", DB_FILE)
     conn.commit()
+    cur.close()
     conn.close()
 
 
 def db_get_trading_wallet(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    row = conn.execute("SELECT address, private_key FROM trading_wallets WHERE user_id=?", (user_id,)).fetchone()
+    conn, is_pg = get_db()
+    cur = conn.cursor()
+    q = "SELECT address, private_key FROM trading_wallets WHERE user_id=%s" if is_pg else "SELECT address, private_key FROM trading_wallets WHERE user_id=?"
+    cur.execute(q, (user_id,))
+    row = cur.fetchone()
+    cur.close()
     conn.close()
     return (row[0], row[1]) if row else None
 
 
 def db_set_trading_wallet(user_id, address, private_key):
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
+    conn, is_pg = get_db()
+    cur = conn.cursor()
+    q = """
+        INSERT INTO trading_wallets (user_id, address, private_key) VALUES (%s, %s, %s)
+        ON CONFLICT(user_id) DO UPDATE SET address=EXCLUDED.address, private_key=EXCLUDED.private_key
+    """ if is_pg else """
         INSERT INTO trading_wallets (user_id, address, private_key) VALUES (?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET address=excluded.address, private_key=excluded.private_key
-    """, (user_id, address, private_key))
+    """
+    cur.execute(q, (user_id, address, private_key))
     conn.commit()
+    cur.close()
     conn.close()
 
 
 def db_remove_trading_wallet(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.execute("DELETE FROM trading_wallets WHERE user_id=?", (user_id,))
+    conn, is_pg = get_db()
+    cur = conn.cursor()
+    q = "DELETE FROM trading_wallets WHERE user_id=%s" if is_pg else "DELETE FROM trading_wallets WHERE user_id=?"
+    cur.execute(q, (user_id,))
     conn.commit()
     removed = cur.rowcount > 0
+    cur.close()
     conn.close()
     return removed
 
@@ -180,65 +239,74 @@ def parse_and_validate_private_key(key_str: str):
         return None
 
 
-
-
-
 def db_add(user_id, name, address):
-    conn = sqlite3.connect(DB_FILE)
+    conn, is_pg = get_db()
+    cur = conn.cursor()
+    q = "INSERT INTO wallets (user_id, name, address) VALUES (%s, %s, %s)" if is_pg else "INSERT INTO wallets (user_id, name, address) VALUES (?, ?, ?)"
     try:
-        conn.execute(
-            "INSERT INTO wallets (user_id, name, address) VALUES (?, ?, ?)",
-            (user_id, name, address),
-        )
+        cur.execute(q, (user_id, name, address))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except Exception:
         return False
     finally:
+        cur.close()
         conn.close()
 
 
 def db_count(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    n = conn.execute("SELECT COUNT(*) FROM wallets WHERE user_id=?", (user_id,)).fetchone()[0]
+    conn, is_pg = get_db()
+    cur = conn.cursor()
+    q = "SELECT COUNT(*) FROM wallets WHERE user_id=%s" if is_pg else "SELECT COUNT(*) FROM wallets WHERE user_id=?"
+    cur.execute(q, (user_id,))
+    n = cur.fetchone()[0]
+    cur.close()
     conn.close()
     return n
 
 
 def db_list(user_id):
     """Returns list of (name, address, paused) tuples ordered by insertion."""
-    conn = sqlite3.connect(DB_FILE)
-    rows = conn.execute(
-        "SELECT name, address, paused FROM wallets WHERE user_id=? ORDER BY id", (user_id,)
-    ).fetchall()
+    conn, is_pg = get_db()
+    cur = conn.cursor()
+    q = "SELECT name, address, paused FROM wallets WHERE user_id=%s ORDER BY id" if is_pg else "SELECT name, address, paused FROM wallets WHERE user_id=? ORDER BY id"
+    cur.execute(q, (user_id,))
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return rows
 
 
 def db_set_paused(user_id, name, paused: bool):
     """Toggle the paused flag for a single wallet."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute(
-        "UPDATE wallets SET paused=? WHERE user_id=? AND name=?",
-        (1 if paused else 0, user_id, name),
-    )
+    conn, is_pg = get_db()
+    cur = conn.cursor()
+    q = "UPDATE wallets SET paused=%s WHERE user_id=%s AND name=%s" if is_pg else "UPDATE wallets SET paused=? WHERE user_id=? AND name=?"
+    cur.execute(q, (1 if paused else 0, user_id, name))
     conn.commit()
+    cur.close()
     conn.close()
 
 
 def db_remove(user_id, name):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.execute("DELETE FROM wallets WHERE user_id=? AND name=?", (user_id, name))
+    conn, is_pg = get_db()
+    cur = conn.cursor()
+    q = "DELETE FROM wallets WHERE user_id=%s AND name=%s" if is_pg else "DELETE FROM wallets WHERE user_id=? AND name=?"
+    cur.execute(q, (user_id, name))
     conn.commit()
     removed = cur.rowcount > 0
+    cur.close()
     conn.close()
     return removed
 
 
 def db_all_wallets():
     """Returns list of (user_id, name, address, paused) for every user."""
-    conn = sqlite3.connect(DB_FILE)
-    rows = conn.execute("SELECT user_id, name, address, paused FROM wallets").fetchall()
+    conn, is_pg = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, name, address, paused FROM wallets")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return rows
 
@@ -1309,7 +1377,7 @@ def main():
     application.add_handler(CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CallbackQueryHandler(on_trading_wallet_callback, pattern=r"^twal:"))
-    application.add_handler(CallbackQueryHandler(on_remove_callback, pattern=r"^rm:"))
+    application.add_handler(CallbackQueryHandler(on_remfove_callback, pattern=r"^rm:"))
     application.add_handler(CallbackQueryHandler(on_pause_callback, pattern=r"^pg:"))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
     application.add_error_handler(on_error)
