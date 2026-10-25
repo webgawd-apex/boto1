@@ -7,8 +7,10 @@ import struct
 import logging
 import html
 import time
+import json
 from dotenv import load_dotenv
 import requests
+from solders.keypair import Keypair
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -108,6 +110,13 @@ def db_init():
             address  TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trading_wallets (
+            user_id     INTEGER PRIMARY KEY,
+            address     TEXT NOT NULL,
+            private_key TEXT NOT NULL
+        )
+    """)
     # Migration: add paused column to databases created before this version.
     # ALTER TABLE raises OperationalError if the column already exists — swallow it.
     try:
@@ -118,30 +127,58 @@ def db_init():
     conn.close()
 
 
-def db_get_personal_wallet(user_id):
+def db_get_trading_wallet(user_id):
     conn = sqlite3.connect(DB_FILE)
-    row = conn.execute("SELECT address FROM personal_wallets WHERE user_id=?", (user_id,)).fetchone()
+    row = conn.execute("SELECT address, private_key FROM trading_wallets WHERE user_id=?", (user_id,)).fetchone()
     conn.close()
-    return row[0] if row else None
+    return (row[0], row[1]) if row else None
 
 
-def db_set_personal_wallet(user_id, address):
+def db_set_trading_wallet(user_id, address, private_key):
     conn = sqlite3.connect(DB_FILE)
     conn.execute("""
-        INSERT INTO personal_wallets (user_id, address) VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET address=excluded.address
-    """, (user_id, address))
+        INSERT INTO trading_wallets (user_id, address, private_key) VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET address=excluded.address, private_key=excluded.private_key
+    """, (user_id, address, private_key))
     conn.commit()
     conn.close()
 
 
-def db_remove_personal_wallet(user_id):
+def db_remove_trading_wallet(user_id):
     conn = sqlite3.connect(DB_FILE)
-    cur = conn.execute("DELETE FROM personal_wallets WHERE user_id=?", (user_id,))
+    cur = conn.execute("DELETE FROM trading_wallets WHERE user_id=?", (user_id,))
     conn.commit()
     removed = cur.rowcount > 0
     conn.close()
     return removed
+
+
+def generate_new_wallet():
+    """Generates a fresh Solana keypair. Returns (address, private_key_b58)."""
+    kp = Keypair()
+    return str(kp.pubkey()), str(kp)
+
+
+def parse_and_validate_private_key(key_str: str):
+    """Validates base58 private key or JSON byte array. Returns (pubkey, private_key_b58) or None."""
+    s = key_str.strip()
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            b = bytes(json.loads(s))
+            if len(b) == 64:
+                k = Keypair.from_bytes(b)
+                return str(k.pubkey()), str(k)
+            elif len(b) == 32:
+                k = Keypair.from_seed(b)
+                return str(k.pubkey()), str(k)
+        except Exception:
+            pass
+    try:
+        k = Keypair.from_base58_string(s)
+        return str(k.pubkey()), str(k)
+    except Exception:
+        return None
+
 
 
 
@@ -391,18 +428,19 @@ def check_rug(mint):
 # --- Telegram handlers ------------------------------------------------------
 
 BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
-ASK_ADDRESS, ASK_NAME, ASK_IMPORT_ADDR = range(3)
+ASK_ADDRESS, ASK_NAME, ASK_IMPORT_KEY = range(3)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     text = (
-        "👋 <b>Solana Wallet Watcher</b>\n\n"
+        "👋 <b>Solana Wallet Watcher & Trader</b>\n\n"
         "I monitor Solana wallets in real time and alert you when they buy "
-        "or sell tokens, complete with live wallet balance and an on-chain safety score.\n\n"
+        "or sell tokens, complete with live balance and an on-chain safety score.\n\n"
         "<b>Commands:</b>\n"
-        "• /my_wallet — View or connect your personal wallet\n"
-        "• /import_wallet — Connect/update your personal wallet\n"
+        "• /my_wallet — Manage your trading wallet (generate or import)\n"
+        "• /create_wallet — Generate a new trading wallet\n"
+        "• /import_wallet — Import an existing trading wallet private key\n"
         "• /new_watch — Add a wallet to watch (max 10)\n"
         "• /my_watches — List your tracked wallets\n"
         "• /pause_watch — Pause or resume watching a wallet\n"
@@ -413,26 +451,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# --- Personal Wallet Feature -----------------------------------------------
+# --- Trading Wallet Dual Mode (Generate or Import) --------------------------
 
 async def cmd_my_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays the user's personal wallet with live SOL balance and token count."""
+    """Displays the user's trading wallet with balance, deposit address, and action buttons."""
     user_id = update.effective_user.id
-    addr = db_get_personal_wallet(user_id)
-    if not addr:
-        buttons = InlineKeyboardMarkup([[
-            InlineKeyboardButton("➕ Connect My Wallet", callback_data="wal:import"),
-        ]])
+    tw = db_get_trading_wallet(user_id)
+    if not tw:
+        buttons = [
+            [InlineKeyboardButton("🆕 Generate New Wallet", callback_data="twal:create")],
+            [InlineKeyboardButton("📥 Import Private Key", callback_data="twal:import_prompt")],
+        ]
         await update.effective_message.reply_text(
-            "💼 <b>Personal Wallet</b>\n\n"
-            "You haven't connected your personal wallet yet.\n"
-            "Connect your wallet to view your balance, tokens, and quick links anytime.\n\n"
-            "Tap below or send /import_wallet to connect.",
+            "⚡ <b>Solana Trading Wallet</b>\n\n"
+            "You don't have a trading wallet connected yet.\n\n"
+            "Choose an option below:\n"
+            "• <b>Generate New Wallet</b>: Creates a fresh dedicated burner wallet and reveals your private key.\n"
+            "• <b>Import Private Key</b>: Connect an existing burner wallet using its private key.",
             parse_mode="HTML",
-            reply_markup=buttons,
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
 
+    addr, _ = tw
     sol = await asyncio.to_thread(get_sol_balance, addr)
     sol_str = f"{sol:.4f} SOL" if sol is not None else "unavailable"
     mints = await asyncio.to_thread(fetch_wallet_mints, addr)
@@ -440,109 +481,260 @@ async def cmd_my_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons = [
         [
+            InlineKeyboardButton("🔑 Show Private Key", callback_data="twal:export"),
+            InlineKeyboardButton("🔄 Reset Wallet", callback_data="twal:reset_confirm"),
+        ],
+        [
             InlineKeyboardButton("🔍 Birdeye", url=f"https://birdeye.so/profile/{addr}?chain=solana"),
             InlineKeyboardButton("🌐 Solscan", url=f"https://solscan.io/account/{addr}"),
         ],
-        [
-            InlineKeyboardButton("🔄 Change Wallet", callback_data="wal:import"),
-            InlineKeyboardButton("🗑 Disconnect", callback_data="wal:disconnect"),
-        ],
     ]
     await update.effective_message.reply_text(
-        "💼 <b>My Personal Wallet</b>\n\n"
-        f"Address: <code>{addr}</code>\n"
-        f"SOL Balance: <b>{sol_str}</b>\n"
-        f"Tokens Held: <b>{token_count}</b>",
+        "⚡ <b>My Trading Wallet</b>\n\n"
+        f"💳 <b>Deposit Address:</b>\n<code>{addr}</code>\n"
+        f"<i>(Tap address above to copy)</i>\n\n"
+        f"💰 SOL Balance: <b>{sol_str}</b>\n"
+        f"🪙 Tokens Held: <b>{token_count}</b>\n\n"
+        "<i>Send SOL to your deposit address to fund your trading wallet.</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(buttons),
         disable_web_page_preview=True,
     )
 
 
+async def cmd_create_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generates a fresh Solana keypair and displays address & private key."""
+    user_id = update.effective_user.id
+    addr, pk = generate_new_wallet()
+    db_set_trading_wallet(user_id, addr, pk)
+
+    buttons = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💼 View Wallet Dashboard", callback_data="twal:view"),
+    ]])
+    await update.effective_message.reply_text(
+        "🎉 <b>New Trading Wallet Created!</b>\n\n"
+        f"💳 <b>Deposit Address:</b>\n<code>{addr}</code>\n"
+        f"<i>(Tap address above to copy)</i>\n\n"
+        f"🔑 <b>Private Key:</b>\n<code>{pk}</code>\n"
+        f"<i>(Tap private key above to copy)</i>\n\n"
+        "⚠️ <b>IMPORTANT:</b>\n"
+        "• Tap the private key above to copy and save it into Phantom or Solflare.\n"
+        "• Send SOL to your deposit address to begin trading.\n"
+        "• Use /my_wallet anytime to view your balance.",
+        parse_mode="HTML",
+        reply_markup=buttons,
+    )
+    return ConversationHandler.END
+
+
 async def cmd_import_wallet_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point for /import_wallet or /add_wallet."""
+    """Entry point for /import_wallet. Accepts key as argument: /import_wallet <key> or prompts."""
     user_id = update.effective_user.id
 
     if context.args and len(context.args) > 0:
-        addr = context.args[0].strip()
-        if (32 <= len(addr) <= 44) and all(c in BASE58_ALPHABET for c in addr):
-            db_set_personal_wallet(user_id, addr)
+        raw_key = context.args[0].strip()
+        validated = parse_and_validate_private_key(raw_key)
+        if validated:
+            addr, pk = validated
+            db_set_trading_wallet(user_id, addr, pk)
+            try:
+                await update.effective_message.delete()
+            except Exception:
+                pass
             sol = await asyncio.to_thread(get_sol_balance, addr)
             sol_str = f"{sol:.4f} SOL" if sol is not None else "unavailable"
             mints = await asyncio.to_thread(fetch_wallet_mints, addr)
             token_count = len(mints) if mints is not None else "unavailable"
             await update.effective_message.reply_text(
-                "✅ <b>Personal Wallet Connected!</b>\n\n"
-                f"Address: <code>{addr}</code>\n"
-                f"SOL Balance: <b>{sol_str}</b>\n"
-                f"Tokens Held: <b>{token_count}</b>\n\n"
-                "Use /my_wallet anytime to view your portfolio.",
+                "✅ <b>Trading Wallet Connected!</b>\n\n"
+                f"💳 <b>Address:</b>\n<code>{addr}</code>\n"
+                f"<i>(Tap address above to copy)</i>\n\n"
+                f"💰 SOL Balance: <b>{sol_str}</b>\n"
+                f"🪙 Tokens Held: <b>{token_count}</b>\n\n"
+                "Use /my_wallet anytime to view your dashboard.",
                 parse_mode="HTML",
             )
             return ConversationHandler.END
         else:
             await update.effective_message.reply_text(
-                "That does not look like a valid Solana address. Try again or /cancel."
+                "❌ That is not a valid Solana private key. Try again or /cancel."
             )
-            return ASK_IMPORT_ADDR
+            return ASK_IMPORT_KEY
 
     await update.effective_message.reply_text(
-        "💼 <b>Connect Your Personal Wallet</b>\n\n"
-        "Send your Solana wallet address:\n"
-        "<i>(We will never ask for private keys or seed phrases — only your public address)</i>",
+        "📥 <b>Import Existing Trading Wallet</b>\n\n"
+        "Send your Solana private key (base58 format or JSON byte array):\n"
+        "<i>(We recommend using a dedicated burner trading wallet)</i>\n\n"
+        "Type /cancel to abort.",
         parse_mode="HTML",
     )
-    return ASK_IMPORT_ADDR
+    return ASK_IMPORT_KEY
 
 
-async def recv_import_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    addr = update.effective_message.text.strip()
-    if not (32 <= len(addr) <= 44) or not all(c in BASE58_ALPHABET for c in addr):
+async def recv_import_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_key = update.effective_message.text.strip()
+    validated = parse_and_validate_private_key(raw_key)
+    if not validated:
         await update.effective_message.reply_text(
-            "That does not look like a Solana address. Try again or /cancel."
+            "❌ That is not a valid Solana private key. Please check and try again, or /cancel."
         )
-        return ASK_IMPORT_ADDR
+        return ASK_IMPORT_KEY
 
+    addr, pk = validated
     user_id = update.effective_user.id
-    db_set_personal_wallet(user_id, addr)
+    db_set_trading_wallet(user_id, addr, pk)
+
+    # Delete the message containing the private key to protect user privacy
+    try:
+        await update.effective_message.delete()
+    except Exception:
+        pass
+
     sol = await asyncio.to_thread(get_sol_balance, addr)
     sol_str = f"{sol:.4f} SOL" if sol is not None else "unavailable"
     mints = await asyncio.to_thread(fetch_wallet_mints, addr)
     token_count = len(mints) if mints is not None else "unavailable"
 
     await update.effective_message.reply_text(
-        "✅ <b>Personal Wallet Connected!</b>\n\n"
-        f"Address: <code>{addr}</code>\n"
-        f"SOL Balance: <b>{sol_str}</b>\n"
-        f"Tokens Held: <b>{token_count}</b>\n\n"
-        "Use /my_wallet anytime to view your balance and portfolio.",
+        "✅ <b>Trading Wallet Connected!</b>\n\n"
+        f"💳 <b>Address:</b>\n<code>{addr}</code>\n"
+        f"<i>(Tap address above to copy)</i>\n\n"
+        f"💰 SOL Balance: <b>{sol_str}</b>\n"
+        f"🪙 Tokens Held: <b>{token_count}</b>\n\n"
+        "Use /my_wallet anytime to view your balance and actions.",
         parse_mode="HTML",
     )
     return ConversationHandler.END
 
 
-async def on_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_trading_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data or ""
     await query.answer()
 
-    if data == "wal:disconnect":
-        db_remove_personal_wallet(user_id)
+    if data == "twal:create":
+        addr, pk = generate_new_wallet()
+        db_set_trading_wallet(user_id, addr, pk)
+        buttons = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💼 View Wallet Dashboard", callback_data="twal:view"),
+        ]])
         await query.edit_message_text(
-            "🗑 <b>Personal wallet disconnected.</b>\nUse /import_wallet anytime to connect a new wallet.",
+            "🎉 <b>New Trading Wallet Created!</b>\n\n"
+            f"💳 <b>Deposit Address:</b>\n<code>{addr}</code>\n"
+            f"<i>(Tap address above to copy)</i>\n\n"
+            f"🔑 <b>Private Key:</b>\n<code>{pk}</code>\n"
+            f"<i>(Tap private key above to copy)</i>\n\n"
+            "⚠️ <b>IMPORTANT:</b>\n"
+            "• Tap the private key above to copy and save it into Phantom or Solflare.\n"
+            "• Send SOL to your deposit address to begin trading.\n"
+            "• Use /my_wallet anytime to view your balance.",
+            parse_mode="HTML",
+            reply_markup=buttons,
+        )
+        return
+
+    if data == "twal:import_prompt":
+        await query.edit_message_text(
+            "📥 <b>Import Trading Wallet</b>\n\n"
+            "To connect your existing trading wallet, send your private key:\n"
+            "👉 Send: <code>/import_wallet YOUR_PRIVATE_KEY</code>\n\n"
+            "Or simply type /import_wallet and follow the prompt.",
             parse_mode="HTML",
         )
         return
 
-    if data == "wal:import":
+    if data == "twal:export":
+        tw = db_get_trading_wallet(user_id)
+        if not tw:
+            await query.edit_message_text("No trading wallet found. Use /create_wallet.")
+            return
+        _, pk = tw
+        buttons = InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Back to Wallet", callback_data="twal:view"),
+        ]])
         await query.edit_message_text(
-            "💼 <b>Connect Your Personal Wallet</b>\n\n"
-            "Send your address using /import_wallet &lt;address&gt; or tap below to start:\n"
-            "👉 Send: <code>/import_wallet YOUR_ADDRESS</code>",
+            "🔑 <b>Your Trading Private Key:</b>\n\n"
+            f"<code>{pk}</code>\n\n"
+            "<i>(Tap key above to copy directly into Phantom or Solflare)</i>\n\n"
+            "⚠️ <b>Never share this key with anyone!</b>",
             parse_mode="HTML",
+            reply_markup=buttons,
         )
         return
+
+    if data == "twal:reset_confirm":
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚠️ Yes, Disconnect Wallet", callback_data="twal:reset_yes")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="twal:view")],
+        ])
+        await query.edit_message_text(
+            "⚠️ <b>Disconnect Trading Wallet?</b>\n\n"
+            "Make sure you have saved your private key before proceeding!\n"
+            "Are you sure you want to disconnect?",
+            parse_mode="HTML",
+            reply_markup=buttons,
+        )
+        return
+
+    if data == "twal:reset_yes":
+        db_remove_trading_wallet(user_id)
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🆕 Generate New Wallet", callback_data="twal:create")],
+            [InlineKeyboardButton("📥 Import Private Key", callback_data="twal:import_prompt")],
+        ])
+        await query.edit_message_text(
+            "🗑 <b>Trading wallet disconnected.</b>\n\n"
+            "You can generate a new wallet or import an existing private key anytime.",
+            parse_mode="HTML",
+            reply_markup=buttons,
+        )
+        return
+
+    if data == "twal:view":
+        tw = db_get_trading_wallet(user_id)
+        if not tw:
+            buttons = [
+                [InlineKeyboardButton("🆕 Generate New Wallet", callback_data="twal:create")],
+                [InlineKeyboardButton("📥 Import Private Key", callback_data="twal:import_prompt")],
+            ]
+            await query.edit_message_text(
+                "⚡ <b>Solana Trading Wallet</b>\n\n"
+                "You don't have a trading wallet connected yet.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            return
+
+        addr, _ = tw
+        sol = await asyncio.to_thread(get_sol_balance, addr)
+        sol_str = f"{sol:.4f} SOL" if sol is not None else "unavailable"
+        mints = await asyncio.to_thread(fetch_wallet_mints, addr)
+        token_count = len(mints) if mints is not None else "unavailable"
+
+        buttons = [
+            [
+                InlineKeyboardButton("🔑 Show Private Key", callback_data="twal:export"),
+                InlineKeyboardButton("🔄 Reset Wallet", callback_data="twal:reset_confirm"),
+            ],
+            [
+                InlineKeyboardButton("🔍 Birdeye", url=f"https://birdeye.so/profile/{addr}?chain=solana"),
+                InlineKeyboardButton("🌐 Solscan", url=f"https://solscan.io/account/{addr}"),
+            ],
+        ]
+        await query.edit_message_text(
+            "⚡ <b>My Trading Wallet</b>\n\n"
+            f"💳 <b>Deposit Address:</b>\n<code>{addr}</code>\n"
+            f"<i>(Tap address above to copy)</i>\n\n"
+            f"💰 SOL Balance: <b>{sol_str}</b>\n"
+            f"🪙 Tokens Held: <b>{token_count}</b>\n\n"
+            "<i>Send SOL to your deposit address to fund your trading wallet.</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            disable_web_page_preview=True,
+        )
+        return
+
 
 
 # --- Watched Wallets --------------------------------------------------------
@@ -1025,8 +1217,9 @@ async def post_init(app):
     try:
         await app.bot.set_my_commands([
             BotCommand("start",          "Introduce bot and show commands"),
-            BotCommand("my_wallet",      "View or connect your personal wallet"),
-            BotCommand("import_wallet",  "Connect or update your personal wallet"),
+            BotCommand("my_wallet",      "Manage trading wallet (generate or import)"),
+            BotCommand("create_wallet",   "Generate a fresh trading wallet"),
+            BotCommand("import_wallet",  "Import an existing trading private key"),
             BotCommand("new_watch",      "Watch a Solana wallet (up to 10)"),
             BotCommand("my_watches",     "List tracked wallets"),
             BotCommand("pause_watch",    "Pause or resume watching a wallet"),
@@ -1065,18 +1258,19 @@ def main():
         .build()
     )
 
-    # ConversationHandler for importing a personal wallet
+    # ConversationHandler for importing a trading wallet private key
     import_wallet_conv = ConversationHandler(
         entry_points=[
             CommandHandler(["import_wallet", "importwallet", "add_wallet", "addwallet"], cmd_import_wallet_entry),
         ],
         states={
-            ASK_IMPORT_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_import_address)],
+            ASK_IMPORT_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_import_key)],
         },
         fallbacks=[
             CommandHandler("cancel",                         cmd_cancel),
             CommandHandler(["start", "help"],                cmd_start),
-            CommandHandler(["my_wallet", "mywallet"],        cmd_my_wallet),
+            CommandHandler(["my_wallet", "mywallet", "wallet"], cmd_my_wallet),
+            CommandHandler(["create_wallet", "createwallet"], cmd_create_wallet),
             CommandHandler(["my_watches", "mywatches"],      cmd_my_watches),
             CommandHandler(["new_watch", "newwatch"],        cmd_new_watch),
             CommandHandler(["pause_watch", "pausewatch"],    cmd_pause_watch),
@@ -1095,7 +1289,8 @@ def main():
         fallbacks=[
             CommandHandler("cancel",                         cmd_cancel),
             CommandHandler(["start", "help"],                cmd_start),
-            CommandHandler(["my_wallet", "mywallet"],        cmd_my_wallet),
+            CommandHandler(["my_wallet", "mywallet", "wallet"], cmd_my_wallet),
+            CommandHandler(["create_wallet", "createwallet"], cmd_create_wallet),
             CommandHandler(["import_wallet", "importwallet", "add_wallet", "addwallet"], cmd_import_wallet_entry),
             CommandHandler(["my_watches", "mywatches"],      cmd_my_watches),
             CommandHandler(["pause_watch", "pausewatch"],    cmd_pause_watch),
@@ -1106,13 +1301,14 @@ def main():
 
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
     application.add_handler(CommandHandler(["my_wallet", "mywallet", "wallet"], cmd_my_wallet))
+    application.add_handler(CommandHandler(["create_wallet", "createwallet"], cmd_create_wallet))
     application.add_handler(import_wallet_conv)
     application.add_handler(new_watch)
     application.add_handler(CommandHandler(["my_watches", "mywatches"], cmd_my_watches))
     application.add_handler(CommandHandler(["pause_watch", "pausewatch"], cmd_pause_watch))
     application.add_handler(CommandHandler(["remove_watch", "removewatch"], cmd_remove_watch))
     application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CallbackQueryHandler(on_wallet_callback, pattern=r"^wal:"))
+    application.add_handler(CallbackQueryHandler(on_trading_wallet_callback, pattern=r"^twal:"))
     application.add_handler(CallbackQueryHandler(on_remove_callback, pattern=r"^rm:"))
     application.add_handler(CallbackQueryHandler(on_pause_callback, pattern=r"^pg:"))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
@@ -1126,5 +1322,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
