@@ -1,4 +1,4 @@
-# bot.py
+﻿
 import os
 import asyncio
 import sqlite3
@@ -54,12 +54,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("watcher")
 
 
-# --- Bot state (for /status) ------------------------------------------------
-# Analysis: the monitor is invisible from the outside. These globals expose
-# just enough for /status to prove the loop is alive and Helius is reachable.
-# Written by the monitor loop, read by /status. Both run on the same asyncio
-# loop, so no locking is needed.
-
 state = {
     "last_cycle_ts": 0.0,
     "last_cycle_ms": 0,
@@ -102,14 +96,6 @@ def start_health_server():
     except Exception as e:
         log.warning(f"Could not start health check server on port {port_str}: {e}")
 
-
-# --- Database ---------------------------------------------------------------
-# Keyed by (user_id, name) so one user cannot have two wallets called "main"
-# but two users can each have their own.
-#
-# Persistence:
-# 1. If DATABASE_URL is set (Neon, Supabase, Render Postgres), uses persistent cloud PostgreSQL.
-# 2. Otherwise uses SQLite, automatically storing in persistent mount (/var/data, /data, or $DB_FILE).
 
 def get_db():
     """Returns (conn, is_pg) connected to PostgreSQL or SQLite."""
@@ -313,12 +299,6 @@ def db_all_wallets():
     return rows
 
 
-# --- RPC --------------------------------------------------------------------
-# Single choke point. Any failure collapses to None. No retries — the next
-# poll is 15s away and retries inside a cycle cause pile-ups. Records success
-# or failure in `state` so /status can tell the user whether Helius is reachable.
-
-# Persistent connection pool with Keep-Alive to eliminate per-call TLS handshakes
 _rpc_session = requests.Session()
 _rpc_adapter = HTTPAdapter(pool_connections=25, pool_maxsize=25)
 _rpc_session.mount("https://", _rpc_adapter)
@@ -350,24 +330,11 @@ def get_sol_balance(address):
         return None
 
 
-# --- Mint decoding ----------------------------------------------------------
-# SPL Token mint layout (fixed width):
-#   0..3    mint_authority COption flag (1 = present)
-#   4..35   mint_authority pubkey
-#   36..43  supply (u64 LE)
-#   44      decimals
-#   45      is_initialized
-#   46..49  freeze_authority COption flag
-#   50..81  freeze_authority pubkey
-
 def parse_mint_account(data):
     mint_flag = struct.unpack_from("<I", data, 0)[0]
     freeze_flag = struct.unpack_from("<I", data, 46)[0]
     return (mint_flag == 1, freeze_flag == 1)
 
-
-# Token-2022 extensions start at offset 166 (82 base + 83 padding + 1 tag).
-# Each entry: u16 type, u16 len, then len bytes. Type 0 = trailing pad, stop.
 
 def parse_token2022_extensions(data):
     extensions = {}
@@ -386,21 +353,11 @@ def parse_token2022_extensions(data):
     return extensions
 
 
-# --- Rug check --------------------------------------------------------------
-# Analysis: static reads only. Never signs, never simulates, never touches a
-# stateful endpoint. Score starts at 100, drops per red flag.
-#
-# Deliberately NOT here, because each needs a service we do not use:
-#   - Liquidity depth (DEX API)
-#   - Bundle / sniper detection (historical tx analysis)
-#   - Holder wallet reputation (label service)
-# Anything we cannot prove with Helius RPC alone is reported as WARN, not SAFE.
-
 def check_rug(mint):
     score = 100
     risks = []
 
-    # Step 1: mint must exist.
+
     acct = rpc("getAccountInfo", [mint, {"encoding": "base64"}])
     if not acct or not acct.get("value"):
         return ("UNKNOWN", 0, ["mint not found"])
@@ -415,7 +372,7 @@ def check_rug(mint):
     if len(data) < 82:
         return ("UNKNOWN", 0, ["data unavailable"])
 
-    # Step 2: classic authorities.
+
     try:
         has_mint_auth, has_freeze_auth = parse_mint_account(data)
     except Exception:
@@ -428,7 +385,7 @@ def check_rug(mint):
         score -= 30
         risks.append("Freeze authority active — sell can be blocked")
 
-    # Step 3: Token-2022 extras (only if the mint is owned by that program).
+
     if owner == TOKEN_2022_PROGRAM:
         try:
             exts = parse_token2022_extensions(data)
@@ -452,7 +409,7 @@ def check_rug(mint):
         if 1 in exts:
             ext_data = exts[1]
             if len(ext_data) >= 68:
-                # Newer fee lives at offset 66 inside the extension body.
+
                 newer_bps = struct.unpack_from("<H", ext_data, 66)[0]
                 if newer_bps > 500:
                     score -= 20
@@ -460,8 +417,7 @@ def check_rug(mint):
                 if newer_bps > 0:
                     risks.append(f"Transfer fee {newer_bps / 100:.2f}%")
 
-    # Steps 4 + 5: fetch holder concentration and metadata in parallel to
-    # halve the latency compared to issuing them one after another.
+
     def _fetch_supply():
         return rpc("getTokenSupply", [mint])
 
@@ -479,7 +435,7 @@ def check_rug(mint):
         largest_res = f_largest.result()
         asset_res   = f_asset.result()
 
-    # Step 4: top-10 holder concentration vs. total supply.
+
     try:
         if supply_res and largest_res:
             total = int(supply_res["value"]["amount"])
@@ -496,7 +452,7 @@ def check_rug(mint):
     except Exception as e:
         log.warning("holder check failed for %s: %s", mint, e)
 
-    # Step 5: metadata mutability via Helius DAS.
+
     try:
         if asset_res and isinstance(asset_res, dict) and asset_res.get("mutable") is True:
             score -= 10
@@ -504,7 +460,7 @@ def check_rug(mint):
     except Exception as e:
         log.warning("getAsset failed for %s: %s", mint, e)
 
-    # Step 6: clamp and bucket.
+
     score = max(0, min(100, score))
     if score >= 70:
         verdict = "SAFE"
@@ -514,8 +470,6 @@ def check_rug(mint):
         verdict = "DANGER"
     return (verdict, score, risks[:5])
 
-
-# --- Telegram handlers ------------------------------------------------------
 
 BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 ASK_ADDRESS, ASK_NAME, ASK_IMPORT_KEY = range(3)
@@ -528,20 +482,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "I monitor Solana wallets in real time and alert you when they buy "
         "or sell tokens, complete with live balance and an on-chain safety score.\n\n"
         "<b>Commands:</b>\n"
-        "• /my_wallet — Manage your trading wallet (generate or import)\n"
-        "• /create_wallet — Generate a new trading wallet\n"
-        "• /import_wallet — Import an existing trading wallet private key\n"
-        "• /new_watch — Add a wallet to watch (max 10)\n"
-        "• /my_watches — List your tracked wallets\n"
-        "• /pause_watch — Pause or resume watching a wallet\n"
-        "• /remove_watch — Remove a watched wallet\n"
-        "• /cancel — Abort the current operation"
+        "• /my_wallet - manage your trading wallet (generate or import)\n"
+        "• /create_wallet - generate a new trading wallet\n"
+        "• /import_wallet - import an existing trading wallet private key\n"
+        "• /new_watch -add a wallet to watch (max 10)\n"
+        "• /my_watches - list your tracked wallets\n"
+        "• /pause_watch - pause or resume watching a wallet\n"
+        "• /remove_watch - remove a watched wallet\n"
+        "• /cancel - abort the current operation"
     )
     await update.effective_message.reply_text(text, parse_mode="HTML")
     return ConversationHandler.END
 
-
-# --- Trading Wallet Dual Mode (Generate or Import) --------------------------
 
 async def cmd_my_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the user's trading wallet with balance, deposit address, and action buttons."""
@@ -674,7 +626,7 @@ async def recv_import_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db_set_trading_wallet(user_id, addr, pk)
 
-    # Delete the message containing the private key to protect user privacy
+
     try:
         await update.effective_message.delete()
     except Exception:
@@ -826,9 +778,6 @@ async def on_trading_wallet_callback(update: Update, context: ContextTypes.DEFAU
         return
 
 
-
-# --- Watched Wallets --------------------------------------------------------
-
 async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -935,9 +884,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_my_watches(update, context)
 
 
-
-# --- Pause / Resume flow (callback-based) -----------------------------------
-
 def _pause_keyboard(rows):
     buttons = []
     for name, addr, paused in rows:
@@ -994,8 +940,6 @@ async def on_pause_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("Something went wrong. Try /pause_watch again.")
 
 
-# --- Remove flow (callback-based, no argument needed) -----------------------
-
 async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = db_list(user_id)
@@ -1024,16 +968,16 @@ async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = query.from_user.id
     data = query.data or ""
 
-    # Acknowledge the tap, otherwise Telegram shows a spinner on the button.
+
     await query.answer()
 
     parts = data.split(":", 2)
 
-    # --- Pick: user chose a wallet from the list ---
+
     if len(parts) == 3 and parts[0] == "rm" and parts[1] == "pick":
         name = parts[2]
-        # The wallet may have been removed by another session. Re-check
-        # before showing confirm.
+
+
         existing = {n: a for n, a, _ in db_list(user_id)}
         if name not in existing:
             await query.edit_message_text(
@@ -1054,10 +998,10 @@ async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    # --- Yes: user confirmed ---
+
     if len(parts) == 3 and parts[0] == "rm" and parts[1] == "yes":
         name = parts[2]
-        # Read addr BEFORE deleting so we can pop the baseline cleanly.
+
         existing = {n: a for n, a, _ in db_list(user_id)}
         addr = existing.get(name)
         removed = db_remove(user_id, name)
@@ -1075,12 +1019,12 @@ async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         return
 
-    # --- No: user cancelled ---
+
     if data == "rm:no":
         await query.edit_message_text("Removal cancelled.")
         return
 
-    # Unknown payload — fail gracefully.
+
     await query.edit_message_text("Something went wrong. Try /remove_watch again.")
 
 
@@ -1088,20 +1032,12 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Telegram handler error: %s", context.error)
 
 
-# --- Monitor ----------------------------------------------------------------
-# Analysis: baselines keyed by (user_id, address), not row id, so removing and
-# re-adding the same wallet keeps the baseline. First sight is silent — alerting
-# on initial state would dump every token the wallet ever held into the chat.
-
 baselines = {}
 
 
 def fetch_wallet_mints(address):
-    # Returns None on RPC failure so the caller can tell "empty wallet" apart
-    # from "request failed". The two must not be conflated in the monitor.
-    # Queries BOTH TOKEN_PROGRAM and TOKEN_2022_PROGRAM so Token-2022 purchases
-    # (e.g. pump.fun tokens launched post-migration) are detected too.
-    # Only accounts with balance > 0 are counted so that selling tokens is detected immediately.
+
+
     mints = set()
 
     for program_id in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
@@ -1111,9 +1047,8 @@ def fetch_wallet_mints(address):
             {"encoding": "jsonParsed"},
         ])
         if res is None:
-            # If either side fails, treat the whole call as failed.
-            # This prevents a partial baseline that would silently miss one
-            # token program and corrupt the diff on the next cycle.
+
+
             return None
         for item in res.get("value", []):
             try:
@@ -1170,7 +1105,7 @@ async def send_sell_alert(app, user_id, name, mint, address):
 
 
 async def send_verdict(app, user_id, mint):
-    # Off the event loop — check_rug does blocking HTTP.
+
     try:
         verdict, score, risks = await asyncio.to_thread(check_rug, mint)
     except Exception as e:
@@ -1189,8 +1124,7 @@ async def send_verdict(app, user_id, mint):
         f"{risk_text}"
     )
 
-    # Deep links only — the user signs in their own wallet. The bot never
-    # touches a private key, so there is nothing to compromise here.
+
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
             "🔍 Birdeye",
@@ -1228,20 +1162,14 @@ async def monitor_loop(app):
             wallet_count = len(wallets)
             still_present = set()
 
-            # ---- Address deduplication ----------------------------------------
-            # Multiple users may watch the same address (e.g. a popular whale).
-            # Fetch each unique, non-paused address exactly once, then share the
-            # result across every (user_id, name) entry that maps to it.
+
             unique_addresses = set()
             for user_id, name, address, paused in wallets:
                 still_present.add((user_id, address))
                 if not paused:
                     unique_addresses.add(address)
 
-            # ---- Concurrent fetch (bounded by semaphore) ----------------------
-            # Semaphore(5): at most 5 simultaneous RPC pair-calls so we stay well
-            # within Helius free-tier rate limits while still being ~5x faster
-            # than the old serial loop.
+
             _sem = asyncio.Semaphore(5)
 
             async def _fetch_one(addr):
@@ -1253,7 +1181,7 @@ async def monitor_loop(app):
                 return_exceptions=True,
             )
 
-            # Build address -> mints map; None means RPC failure for that address.
+
             addr_mints: dict = {}
             for res in fetch_results:
                 if isinstance(res, Exception):
@@ -1266,7 +1194,7 @@ async def monitor_loop(app):
                 else:
                     addr_mints[addr] = mints
 
-            # ---- Diff and alert (still sequential so Telegram isn't hammered) -
+
             for user_id, name, address, paused in wallets:
                 key = (user_id, address)
 
@@ -1274,7 +1202,7 @@ async def monitor_loop(app):
                     continue
 
                 if address not in addr_mints:
-                    # RPC failed for this address; skip without touching baseline.
+
                     continue
 
                 mints = addr_mints[address]
@@ -1288,12 +1216,12 @@ async def monitor_loop(app):
                         )
                         continue
 
-                    new_mints  = mints - baselines[key]   # tokens that appeared (buy)
-                    sold_mints = baselines[key] - mints   # tokens that left (sell)
+                    new_mints  = mints - baselines[key]
+                    sold_mints = baselines[key] - mints
 
                     if new_mints or sold_mints:
-                        # Update baseline BEFORE awaiting sends, so a slow
-                        # Telegram call cannot cause a re-alert next cycle.
+
+
                         baselines[key] = mints
 
                         for mint in new_mints:
@@ -1312,7 +1240,7 @@ async def monitor_loop(app):
                     log.error("wallet %s (%s) diff failed: %s", name, address, e)
                     continue
 
-            # Drop baselines for wallets removed from the DB.
+
             for key in list(baselines.keys()):
                 if key not in still_present:
                     del baselines[key]
@@ -1320,7 +1248,7 @@ async def monitor_loop(app):
         except Exception as e:
             log.error("monitor loop iteration failed: %s", e)
 
-        # Heartbeat + state for /status
+
         cycle_ms = int((time.time() - cycle_start) * 1000)
         state["last_cycle_ts"] = time.time()
         state["last_cycle_ms"] = cycle_ms
@@ -1335,8 +1263,6 @@ async def monitor_loop(app):
 
         await asyncio.sleep(POLL_INTERVAL)
 
-
-# --- Entry point ------------------------------------------------------------
 
 async def post_init(app):
     try:
@@ -1361,8 +1287,7 @@ def main():
     start_health_server()
     db_init()
 
-    # Ensure an active asyncio event loop exists on this thread
-    # (required for Python 3.12+ / 3.14 which removed implicit loop creation).
+
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
@@ -1383,7 +1308,7 @@ def main():
         .build()
     )
 
-    # ConversationHandler for importing a trading wallet private key
+
     import_wallet_conv = ConversationHandler(
         entry_points=[
             CommandHandler(["import_wallet", "importwallet", "add_wallet", "addwallet"], cmd_import_wallet_entry),
@@ -1404,7 +1329,7 @@ def main():
         allow_reentry=True,
     )
 
-    # ConversationHandler for the /new_watch multi-step flow.
+
     new_watch = ConversationHandler(
         entry_points=[CommandHandler(["new_watch", "newwatch"], cmd_new_watch)],
         states={
@@ -1440,12 +1365,11 @@ def main():
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,   # Do not replay stale messages after redeployment
+        drop_pending_updates=True,
     )
 
 
 if __name__ == "__main__":
     main()
-
 
 
