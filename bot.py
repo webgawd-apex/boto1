@@ -1,4 +1,3 @@
-﻿
 import os
 import asyncio
 import sqlite3
@@ -39,7 +38,6 @@ POLL_INTERVAL = 15
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def resolve_db_path():
-    """Auto-detect persistent storage directory if on Render (/var/data, /data) or DB_FILE."""
     env_file = os.getenv("DB_FILE")
     if env_file:
         return env_file
@@ -53,7 +51,6 @@ DB_FILE = resolve_db_path()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("watcher")
 
-
 state = {
     "last_cycle_ts": 0.0,
     "last_cycle_ms": 0,
@@ -65,9 +62,7 @@ state = {
     "started_at": time.time(),
 }
 
-
 def start_health_server():
-    """Starts a minimal HTTP health-check server if $PORT is set (e.g. on Render)."""
     port_str = os.environ.get("PORT")
     if not port_str:
         return
@@ -96,9 +91,7 @@ def start_health_server():
     except Exception as e:
         log.warning(f"Could not start health check server on port {port_str}: {e}")
 
-
 def get_db():
-    """Returns (conn, is_pg) connected to PostgreSQL or SQLite."""
     if DATABASE_URL and DATABASE_URL.startswith(("postgres://", "postgresql://")):
         import psycopg2
         url = DATABASE_URL
@@ -110,10 +103,10 @@ def get_db():
         conn = sqlite3.connect(DB_FILE)
         return conn, False
 
-
 def db_init():
     conn, is_pg = get_db()
     cur = conn.cursor()
+    
     if is_pg:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS wallets (
@@ -132,6 +125,10 @@ def db_init():
                 private_key TEXT NOT NULL
             )
         """)
+        try:
+            cur.execute("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS paused INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
         log.info("Database initialized: connected to persistent PostgreSQL")
     else:
         cur.execute("""
@@ -156,10 +153,10 @@ def db_init():
         except Exception:
             pass
         log.info("Database initialized: using SQLite at %s", DB_FILE)
+        
     conn.commit()
     cur.close()
     conn.close()
-
 
 def db_get_trading_wallet(user_id):
     conn, is_pg = get_db()
@@ -170,7 +167,6 @@ def db_get_trading_wallet(user_id):
     cur.close()
     conn.close()
     return (row[0], row[1]) if row else None
-
 
 def db_set_trading_wallet(user_id, address, private_key):
     conn, is_pg = get_db()
@@ -187,7 +183,6 @@ def db_set_trading_wallet(user_id, address, private_key):
     cur.close()
     conn.close()
 
-
 def db_remove_trading_wallet(user_id):
     conn, is_pg = get_db()
     cur = conn.cursor()
@@ -199,15 +194,11 @@ def db_remove_trading_wallet(user_id):
     conn.close()
     return removed
 
-
 def generate_new_wallet():
-    """Generates a fresh Solana keypair. Returns (address, private_key_b58)."""
     kp = Keypair()
     return str(kp.pubkey()), str(kp)
 
-
 def parse_and_validate_private_key(key_str: str):
-    """Validates base58 private key or JSON byte array. Returns (pubkey, private_key_b58) or None."""
     s = key_str.strip()
     if s.startswith("[") and s.endswith("]"):
         try:
@@ -226,7 +217,6 @@ def parse_and_validate_private_key(key_str: str):
     except Exception:
         return None
 
-
 def db_add(user_id, name, address):
     conn, is_pg = get_db()
     cur = conn.cursor()
@@ -241,7 +231,6 @@ def db_add(user_id, name, address):
         cur.close()
         conn.close()
 
-
 def db_count(user_id):
     conn, is_pg = get_db()
     cur = conn.cursor()
@@ -252,9 +241,7 @@ def db_count(user_id):
     conn.close()
     return n
 
-
 def db_list(user_id):
-    """Returns list of (name, address, paused) tuples ordered by insertion."""
     conn, is_pg = get_db()
     cur = conn.cursor()
     q = "SELECT name, address, paused FROM wallets WHERE user_id=%s ORDER BY id" if is_pg else "SELECT name, address, paused FROM wallets WHERE user_id=? ORDER BY id"
@@ -264,9 +251,7 @@ def db_list(user_id):
     conn.close()
     return rows
 
-
 def db_set_paused(user_id, name, paused: bool):
-    """Toggle the paused flag for a single wallet."""
     conn, is_pg = get_db()
     cur = conn.cursor()
     q = "UPDATE wallets SET paused=%s WHERE user_id=%s AND name=%s" if is_pg else "UPDATE wallets SET paused=? WHERE user_id=? AND name=?"
@@ -274,7 +259,6 @@ def db_set_paused(user_id, name, paused: bool):
     conn.commit()
     cur.close()
     conn.close()
-
 
 def db_remove(user_id, name):
     conn, is_pg = get_db()
@@ -287,9 +271,7 @@ def db_remove(user_id, name):
     conn.close()
     return removed
 
-
 def db_all_wallets():
-    """Returns list of (user_id, name, address, paused) for every user."""
     conn, is_pg = get_db()
     cur = conn.cursor()
     cur.execute("SELECT user_id, name, address, paused FROM wallets")
@@ -297,7 +279,6 @@ def db_all_wallets():
     cur.close()
     conn.close()
     return rows
-
 
 _rpc_session = requests.Session()
 _rpc_adapter = HTTPAdapter(pool_connections=25, pool_maxsize=25)
@@ -316,11 +297,7 @@ def rpc(method, params):
         log.warning("rpc %s failed: %s", method, e)
         return None
 
-
 def get_sol_balance(address):
-    """Blocking. Returns SOL as float, or None on any RPC failure.
-    Called only when an alert fires — never on the hot poll path — so it
-    adds zero latency to normal 15-second cycles."""
     res = rpc("getBalance", [address])
     if res is None:
         return None
@@ -329,12 +306,10 @@ def get_sol_balance(address):
     except Exception:
         return None
 
-
 def parse_mint_account(data):
     mint_flag = struct.unpack_from("<I", data, 0)[0]
     freeze_flag = struct.unpack_from("<I", data, 46)[0]
     return (mint_flag == 1, freeze_flag == 1)
-
 
 def parse_token2022_extensions(data):
     extensions = {}
@@ -352,31 +327,52 @@ def parse_token2022_extensions(data):
         offset += ext_len
     return extensions
 
+def fetch_dex_paid(mint):
+    try:
+        url = f"https://api.dexscreener.com/orders/v1/solana/{mint}"
+        r = _rpc_session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                orders = data.get("orders") or []
+                boosts = data.get("boosts") or []
+            elif isinstance(data, list):
+                orders = data
+                boosts = []
+            else:
+                orders, boosts = [], []
+            if boosts:
+                return True
+            for o in orders:
+                if isinstance(o, dict) and o.get("status") in ("approved", "processing"):
+                    return True
+            return bool(orders)
+        return False
+    except Exception:
+        return False
 
 def check_rug(mint):
     score = 100
     risks = []
 
-
     acct = rpc("getAccountInfo", [mint, {"encoding": "base64"}])
     if not acct or not acct.get("value"):
-        return ("UNKNOWN", 0, ["mint not found"])
+        return ("UNKNOWN", 0, ["mint not found"], {"dex_paid": False})
 
     value = acct["value"]
     owner = value.get("owner", "")
     try:
         data = base64.b64decode(value["data"][0])
     except Exception:
-        return ("UNKNOWN", 0, ["data unavailable"])
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False})
 
     if len(data) < 82:
-        return ("UNKNOWN", 0, ["data unavailable"])
-
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False})
 
     try:
         has_mint_auth, has_freeze_auth = parse_mint_account(data)
     except Exception:
-        return ("UNKNOWN", 0, ["data unavailable"])
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False})
 
     if has_mint_auth:
         score -= 30
@@ -384,7 +380,6 @@ def check_rug(mint):
     if has_freeze_auth:
         score -= 30
         risks.append("Freeze authority active — sell can be blocked")
-
 
     if owner == TOKEN_2022_PROGRAM:
         try:
@@ -409,14 +404,12 @@ def check_rug(mint):
         if 1 in exts:
             ext_data = exts[1]
             if len(ext_data) >= 68:
-
                 newer_bps = struct.unpack_from("<H", ext_data, 66)[0]
                 if newer_bps > 500:
                     score -= 20
                     risks.append("Transfer fee >5%")
                 if newer_bps > 0:
                     risks.append(f"Transfer fee {newer_bps / 100:.2f}%")
-
 
     def _fetch_supply():
         return rpc("getTokenSupply", [mint])
@@ -427,14 +420,18 @@ def check_rug(mint):
     def _fetch_asset():
         return rpc("getAsset", [{"id": mint}])
 
-    with ThreadPoolExecutor(max_workers=3) as _pool:
+    def _fetch_dex_paid():
+        return fetch_dex_paid(mint)
+
+    with ThreadPoolExecutor(max_workers=4) as _pool:
         f_supply  = _pool.submit(_fetch_supply)
         f_largest = _pool.submit(_fetch_largest)
         f_asset   = _pool.submit(_fetch_asset)
+        f_dex     = _pool.submit(_fetch_dex_paid)
         supply_res  = f_supply.result()
         largest_res = f_largest.result()
         asset_res   = f_asset.result()
-
+        dex_paid    = f_dex.result()
 
     try:
         if supply_res and largest_res:
@@ -452,14 +449,12 @@ def check_rug(mint):
     except Exception as e:
         log.warning("holder check failed for %s: %s", mint, e)
 
-
     try:
         if asset_res and isinstance(asset_res, dict) and asset_res.get("mutable") is True:
             score -= 10
             risks.append("Metadata mutable")
     except Exception as e:
         log.warning("getAsset failed for %s: %s", mint, e)
-
 
     score = max(0, min(100, score))
     if score >= 70:
@@ -468,12 +463,13 @@ def check_rug(mint):
         verdict = "WARN"
     else:
         verdict = "DANGER"
-    return (verdict, score, risks[:5])
 
+    extra = {"dex_paid": dex_paid}
+
+    return (verdict, score, risks[:5], extra)
 
 BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 ASK_ADDRESS, ASK_NAME, ASK_IMPORT_KEY = range(3)
-
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -482,10 +478,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "I monitor Solana wallets in real time and alert you when they buy "
         "or sell tokens, complete with live balance and an on-chain safety score.\n\n"
         "<b>Commands:</b>\n"
-        "• /my_wallet - manage your trading wallet (generate or import)\n"
-        "• /create_wallet - generate a new trading wallet\n"
-        "• /import_wallet - import an existing trading wallet private key\n"
-        "• /new_watch -add a wallet to watch (max 10)\n"
+        "• /my_wallet - manage your wallet (generate or import)\n"
+        "• /create_wallet - generate a new wallet\n"
+        "• /import_wallet - import an existing wallet private key\n"
+        "• /new_watch -add a wallet to watch(max 10)\n"
         "• /my_watches - list your tracked wallets\n"
         "• /pause_watch - pause or resume watching a wallet\n"
         "• /remove_watch - remove a watched wallet\n"
@@ -494,9 +490,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(text, parse_mode="HTML")
     return ConversationHandler.END
 
-
 async def cmd_my_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays the user's trading wallet with balance, deposit address, and action buttons."""
     user_id = update.effective_user.id
     tw = db_get_trading_wallet(user_id)
     if not tw:
@@ -543,9 +537,7 @@ async def cmd_my_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
-
 async def cmd_create_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generates a fresh Solana keypair and displays address & private key."""
     user_id = update.effective_user.id
     addr, pk = generate_new_wallet()
     db_set_trading_wallet(user_id, addr, pk)
@@ -568,9 +560,7 @@ async def cmd_create_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-
 async def cmd_import_wallet_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point for /import_wallet. Accepts key as argument: /import_wallet <key> or prompts."""
     user_id = update.effective_user.id
 
     if context.args and len(context.args) > 0:
@@ -612,7 +602,6 @@ async def cmd_import_wallet_entry(update: Update, context: ContextTypes.DEFAULT_
     )
     return ASK_IMPORT_KEY
 
-
 async def recv_import_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_key = update.effective_message.text.strip()
     validated = parse_and_validate_private_key(raw_key)
@@ -625,7 +614,6 @@ async def recv_import_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr, pk = validated
     user_id = update.effective_user.id
     db_set_trading_wallet(user_id, addr, pk)
-
 
     try:
         await update.effective_message.delete()
@@ -647,7 +635,6 @@ async def recv_import_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
     return ConversationHandler.END
-
 
 async def on_trading_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -777,7 +764,6 @@ async def on_trading_wallet_callback(update: Update, context: ContextTypes.DEFAU
         )
         return
 
-
 async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -791,7 +777,6 @@ async def cmd_new_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Send the Solana wallet address to watch:")
     return ASK_ADDRESS
 
-
 async def recv_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = update.effective_message.text.strip()
     if not (32 <= len(addr) <= 44) or not all(c in BASE58_ALPHABET for c in addr):
@@ -802,7 +787,6 @@ async def recv_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["address"] = addr
     await update.effective_message.reply_text("Give this wallet a short name:")
     return ASK_NAME
-
 
 async def recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_message.text.strip()
@@ -850,12 +834,10 @@ async def recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.effective_message.reply_text("Cancelled.")
     return ConversationHandler.END
-
 
 async def cmd_my_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -878,11 +860,8 @@ async def cmd_my_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("\n🟢 active  🟡 verifying  ⏸ paused")
     await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
 
-
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Redirect to user wallets list cleanly without exposing internal server metrics."""
     await cmd_my_watches(update, context)
-
 
 def _pause_keyboard(rows):
     buttons = []
@@ -890,7 +869,6 @@ def _pause_keyboard(rows):
         label = f"▶️ Resume {name}" if paused else f"⏸ Pause {name}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"pg:toggle:{name}")])
     return InlineKeyboardMarkup(buttons)
-
 
 async def cmd_pause_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -903,7 +881,6 @@ async def cmd_pause_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=_pause_keyboard(rows),
     )
-
 
 async def on_pause_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -939,7 +916,6 @@ async def on_pause_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text("Something went wrong. Try /pause_watch again.")
 
-
 async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = db_list(user_id)
@@ -962,21 +938,17 @@ async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard,
     )
 
-
 async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data or ""
 
-
     await query.answer()
 
     parts = data.split(":", 2)
 
-
     if len(parts) == 3 and parts[0] == "rm" and parts[1] == "pick":
         name = parts[2]
-
 
         existing = {n: a for n, a, _ in db_list(user_id)}
         if name not in existing:
@@ -998,7 +970,6 @@ async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-
     if len(parts) == 3 and parts[0] == "rm" and parts[1] == "yes":
         name = parts[2]
 
@@ -1019,25 +990,18 @@ async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         return
 
-
     if data == "rm:no":
         await query.edit_message_text("Removal cancelled.")
         return
 
-
     await query.edit_message_text("Something went wrong. Try /remove_watch again.")
-
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Telegram handler error: %s", context.error)
 
-
 baselines = {}
 
-
 def fetch_wallet_mints(address):
-
-
     mints = set()
 
     for program_id in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
@@ -1047,8 +1011,6 @@ def fetch_wallet_mints(address):
             {"encoding": "jsonParsed"},
         ])
         if res is None:
-
-
             return None
         for item in res.get("value", []):
             try:
@@ -1061,9 +1023,7 @@ def fetch_wallet_mints(address):
 
     return mints
 
-
 async def send_buy_alert(app, user_id, name, mint, address):
-    """Notification when a new token appears. Fetches SOL balance only when an alert fires."""
     sol = await asyncio.to_thread(get_sol_balance, address)
     sol_str = f"{sol:.4f} SOL" if sol is not None else "unavailable"
     try:
@@ -1080,9 +1040,7 @@ async def send_buy_alert(app, user_id, name, mint, address):
     except Exception as e:
         log.warning("buy alert send failed: %s", e)
 
-
 async def send_sell_alert(app, user_id, name, mint, address):
-    """Notification when a token leaves the wallet (sold or transferred out)."""
     sol = await asyncio.to_thread(get_sol_balance, address)
     sol_str = f"{sol:.4f} SOL" if sol is not None else "unavailable"
     keyboard = InlineKeyboardMarkup([[
@@ -1103,14 +1061,13 @@ async def send_sell_alert(app, user_id, name, mint, address):
     except Exception as e:
         log.warning("sell alert send failed: %s", e)
 
-
 async def send_verdict(app, user_id, mint):
 
     try:
-        verdict, score, risks = await asyncio.to_thread(check_rug, mint)
+        verdict, score, risks, extra = await asyncio.to_thread(check_rug, mint)
     except Exception as e:
         log.error("check_rug crashed for %s: %s", mint, e)
-        verdict, score, risks = ("UNKNOWN", 0, ["data unavailable"])
+        verdict, score, risks, extra = ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False})
 
     emoji = {"SAFE": "✅", "WARN": "⚠️", "DANGER": "🔴", "UNKNOWN": "❓"}.get(verdict, "❓")
     risk_text = (
@@ -1118,12 +1075,15 @@ async def send_verdict(app, user_id, mint):
         if risks
         else "No structural red flags found."
     )
+    
+    dex_paid_str = "✅ Paid" if (isinstance(extra, dict) and extra.get("dex_paid")) else "❌ Not Paid"
+    
     text = (
         f"{emoji} <b>{verdict}</b> — safety score {score}/100\n"
-        f"CA: <code>{mint}</code>\n\n"
+        f"CA: <code>{mint}</code>\n"
+        f"Dex Paid: {dex_paid_str}\n\n"
         f"{risk_text}"
     )
-
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
@@ -1147,7 +1107,6 @@ async def send_verdict(app, user_id, mint):
     except Exception as e:
         log.warning("verdict send failed: %s", e)
 
-
 async def monitor_loop(app):
     log.info("monitor loop started")
     while True:
@@ -1162,13 +1121,11 @@ async def monitor_loop(app):
             wallet_count = len(wallets)
             still_present = set()
 
-
             unique_addresses = set()
             for user_id, name, address, paused in wallets:
                 still_present.add((user_id, address))
                 if not paused:
                     unique_addresses.add(address)
-
 
             _sem = asyncio.Semaphore(5)
 
@@ -1180,7 +1137,6 @@ async def monitor_loop(app):
                 *[_fetch_one(addr) for addr in unique_addresses],
                 return_exceptions=True,
             )
-
 
             addr_mints: dict = {}
             for res in fetch_results:
@@ -1194,7 +1150,6 @@ async def monitor_loop(app):
                 else:
                     addr_mints[addr] = mints
 
-
             for user_id, name, address, paused in wallets:
                 key = (user_id, address)
 
@@ -1202,7 +1157,6 @@ async def monitor_loop(app):
                     continue
 
                 if address not in addr_mints:
-
                     continue
 
                 mints = addr_mints[address]
@@ -1220,8 +1174,6 @@ async def monitor_loop(app):
                     sold_mints = baselines[key] - mints
 
                     if new_mints or sold_mints:
-
-
                         baselines[key] = mints
 
                         for mint in new_mints:
@@ -1240,14 +1192,12 @@ async def monitor_loop(app):
                     log.error("wallet %s (%s) diff failed: %s", name, address, e)
                     continue
 
-
             for key in list(baselines.keys()):
                 if key not in still_present:
                     del baselines[key]
 
         except Exception as e:
             log.error("monitor loop iteration failed: %s", e)
-
 
         cycle_ms = int((time.time() - cycle_start) * 1000)
         state["last_cycle_ts"] = time.time()
@@ -1263,15 +1213,14 @@ async def monitor_loop(app):
 
         await asyncio.sleep(POLL_INTERVAL)
 
-
 async def post_init(app):
     try:
         await app.bot.set_my_commands([
-            BotCommand("start",          "Introduce bot and show commands"),
-            BotCommand("my_wallet",      "Manage trading wallet (generate or import)"),
-            BotCommand("create_wallet",   "Generate a fresh trading wallet"),
-            BotCommand("import_wallet",  "Import an existing trading private key"),
-            BotCommand("new_watch",      "Watch a Solana wallet (up to 10)"),
+            BotCommand("start",          "Start"),
+            BotCommand("my_wallet",      "Manage wallet (generate or import)"),
+            BotCommand("create_wallet",   "Generate a new wallet"),
+            BotCommand("import_wallet",  "Import an existing wallet"),
+            BotCommand("new_watch",      "Watch a Solana wallet(up to 10)"),
             BotCommand("my_watches",     "List tracked wallets"),
             BotCommand("pause_watch",    "Pause or resume watching a wallet"),
             BotCommand("remove_watch",   "Remove a watched wallet"),
@@ -1282,11 +1231,9 @@ async def post_init(app):
         log.warning("set_my_commands failed: %s", e)
     asyncio.create_task(monitor_loop(app))
 
-
 def main():
     start_health_server()
     db_init()
-
 
     try:
         loop = asyncio.get_event_loop()
@@ -1308,7 +1255,6 @@ def main():
         .build()
     )
 
-
     import_wallet_conv = ConversationHandler(
         entry_points=[
             CommandHandler(["import_wallet", "importwallet", "add_wallet", "addwallet"], cmd_import_wallet_entry),
@@ -1328,7 +1274,6 @@ def main():
         ],
         allow_reentry=True,
     )
-
 
     new_watch = ConversationHandler(
         entry_points=[CommandHandler(["new_watch", "newwatch"], cmd_new_watch)],
@@ -1365,11 +1310,8 @@ def main():
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+        drop_pending_updates=False,
     )
-
 
 if __name__ == "__main__":
     main()
-
-
