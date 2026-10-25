@@ -20,6 +20,8 @@ from telegram.ext import (
 
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter
 
 load_dotenv()
 
@@ -316,10 +318,16 @@ def db_all_wallets():
 # poll is 15s away and retries inside a cycle cause pile-ups. Records success
 # or failure in `state` so /status can tell the user whether Helius is reachable.
 
+# Persistent connection pool with Keep-Alive to eliminate per-call TLS handshakes
+_rpc_session = requests.Session()
+_rpc_adapter = HTTPAdapter(pool_connections=25, pool_maxsize=25)
+_rpc_session.mount("https://", _rpc_adapter)
+_rpc_session.mount("http://", _rpc_adapter)
+
 def rpc(method, params):
     body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     try:
-        r = requests.post(RPC_URL, json=body, timeout=10)
+        r = _rpc_session.post(RPC_URL, json=body, timeout=10)
         result = r.json().get("result")
         state["last_rpc_ok"] = True
         return result
@@ -452,12 +460,27 @@ def check_rug(mint):
                 if newer_bps > 0:
                     risks.append(f"Transfer fee {newer_bps / 100:.2f}%")
 
+    # Steps 4 + 5: fetch holder concentration and metadata in parallel to
+    # halve the latency compared to issuing them one after another.
+    def _fetch_supply():
+        return rpc("getTokenSupply", [mint])
+
+    def _fetch_largest():
+        return rpc("getTokenLargestAccounts", [mint])
+
+    def _fetch_asset():
+        return rpc("getAsset", [{"id": mint}])
+
+    with ThreadPoolExecutor(max_workers=3) as _pool:
+        f_supply  = _pool.submit(_fetch_supply)
+        f_largest = _pool.submit(_fetch_largest)
+        f_asset   = _pool.submit(_fetch_asset)
+        supply_res  = f_supply.result()
+        largest_res = f_largest.result()
+        asset_res   = f_asset.result()
+
     # Step 4: top-10 holder concentration vs. total supply.
-    # Snapshot only. Isolated try/except so a bad response here does not
-    # invalidate the authority checks above.
     try:
-        supply_res = rpc("getTokenSupply", [mint])
-        largest_res = rpc("getTokenLargestAccounts", [mint])
         if supply_res and largest_res:
             total = int(supply_res["value"]["amount"])
             accounts = largest_res.get("value") or []
@@ -475,8 +498,7 @@ def check_rug(mint):
 
     # Step 5: metadata mutability via Helius DAS.
     try:
-        asset = rpc("getAsset", [{"id": mint}])
-        if asset and isinstance(asset, dict) and asset.get("mutable") is True:
+        if asset_res and isinstance(asset_res, dict) and asset_res.get("mutable") is True:
             score -= 10
             risks.append("Metadata mutable")
     except Exception as e:
@@ -1206,35 +1228,67 @@ async def monitor_loop(app):
             wallet_count = len(wallets)
             still_present = set()
 
+            # ---- Address deduplication ----------------------------------------
+            # Multiple users may watch the same address (e.g. a popular whale).
+            # Fetch each unique, non-paused address exactly once, then share the
+            # result across every (user_id, name) entry that maps to it.
+            unique_addresses = set()
+            for user_id, name, address, paused in wallets:
+                still_present.add((user_id, address))
+                if not paused:
+                    unique_addresses.add(address)
+
+            # ---- Concurrent fetch (bounded by semaphore) ----------------------
+            # Semaphore(5): at most 5 simultaneous RPC pair-calls so we stay well
+            # within Helius free-tier rate limits while still being ~5x faster
+            # than the old serial loop.
+            _sem = asyncio.Semaphore(5)
+
+            async def _fetch_one(addr):
+                async with _sem:
+                    return addr, await asyncio.to_thread(fetch_wallet_mints, addr)
+
+            fetch_results = await asyncio.gather(
+                *[_fetch_one(addr) for addr in unique_addresses],
+                return_exceptions=True,
+            )
+
+            # Build address -> mints map; None means RPC failure for that address.
+            addr_mints: dict = {}
+            for res in fetch_results:
+                if isinstance(res, Exception):
+                    fail_count += 1
+                    log.error("fetch gather exception: %s", res)
+                    continue
+                addr, mints = res
+                if mints is None:
+                    fail_count += 1
+                else:
+                    addr_mints[addr] = mints
+
+            # ---- Diff and alert (still sequential so Telegram isn't hammered) -
             for user_id, name, address, paused in wallets:
                 key = (user_id, address)
-                # Keep paused wallets in still_present so their baselines survive.
-                still_present.add(key)
 
                 if paused:
-                    # Skip RPC polling while paused.
                     continue
 
-                # Per-wallet try/except — one bad address or one RPC hiccup
-                # must not take down the whole cycle.
-                try:
-                    mints = await asyncio.to_thread(fetch_wallet_mints, address)
-                    if mints is None:
-                        fail_count += 1
-                        # RPC failed. Skip WITHOUT overwriting the baseline —
-                        # otherwise the failure looks like a full drain and
-                        # we would re-alert on everything next poll.
-                        continue
+                if address not in addr_mints:
+                    # RPC failed for this address; skip without touching baseline.
+                    continue
 
+                mints = addr_mints[address]
+
+                try:
                     if key not in baselines:
                         baselines[key] = mints
                         log.info(
                             "baseline seeded for %s/%s (%d mints)",
-                            user_id, name, len(mints)
+                            user_id, name, len(mints),
                         )
                         continue
 
-                    new_mints = mints - baselines[key]    # tokens that appeared (buy)
+                    new_mints  = mints - baselines[key]   # tokens that appeared (buy)
                     sold_mints = baselines[key] - mints   # tokens that left (sell)
 
                     if new_mints or sold_mints:
@@ -1255,7 +1309,7 @@ async def monitor_loop(app):
 
                 except Exception as e:
                     fail_count += 1
-                    log.error("wallet %s (%s) processing failed: %s", name, address, e)
+                    log.error("wallet %s (%s) diff failed: %s", name, address, e)
                     continue
 
             # Drop baselines for wallets removed from the DB.
