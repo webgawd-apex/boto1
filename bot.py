@@ -393,28 +393,62 @@ def fetch_pump_graduation(mint):
         log.warning("pump graduation check failed for %s: %s", mint, e)
         return None
 
+def fetch_holder_count(mint):
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "holder-check",
+            "method": "getTokenAccounts",
+            "params": {
+                "mint": mint,
+                "limit": 1000,
+                "page": 1
+            }
+        }
+        r = _rpc_session.post(RPC_URL, json=payload, timeout=10)
+        data = r.json()
+        result = data.get("result")
+        if not result:
+            return None
+        
+        accounts = result.get("token_accounts") or []
+        total = result.get("total") or 0
+        
+        owners = set()
+        for acc in accounts:
+            owner = acc.get("owner")
+            if owner:
+                owners.add(owner)
+                
+        if len(accounts) >= 1000:
+            return f"{len(owners)}+"
+        return str(len(owners))
+    except Exception as e:
+        log.warning("holder count fetch failed for %s: %s", mint, e)
+        return None
+
 def check_rug(mint):
     score = 100
     risks = []
 
     acct = rpc("getAccountInfo", [mint, {"encoding": "base64"}])
     if not acct or not acct.get("value"):
-        return ("UNKNOWN", 0, ["mint not found"], {"dex_paid": False, "st_risk": None, "pump": None})
+        return ("UNKNOWN", 0, ["mint not found"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None})
 
     value = acct["value"]
     owner = value.get("owner", "")
     try:
         data = base64.b64decode(value["data"][0])
     except Exception:
-        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None})
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None})
 
     if len(data) < 82:
-        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None})
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None})
 
     try:
         has_mint_auth, has_freeze_auth = parse_mint_account(data)
     except Exception:
-        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None})
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None})
 
     if has_mint_auth:
         score -= 30
@@ -471,13 +505,17 @@ def check_rug(mint):
     def _fetch_pump():
         return fetch_pump_graduation(mint)
 
-    with ThreadPoolExecutor(max_workers=6) as _pool:
+    def _fetch_holders():
+        return fetch_holder_count(mint)
+
+    with ThreadPoolExecutor(max_workers=7) as _pool:
         f_supply  = _pool.submit(_fetch_supply)
         f_largest = _pool.submit(_fetch_largest)
         f_asset   = _pool.submit(_fetch_asset)
         f_dex     = _pool.submit(_fetch_dex_paid)
         f_st      = _pool.submit(_fetch_st_risk)
         f_pump    = _pool.submit(_fetch_pump)
+        f_holders = _pool.submit(_fetch_holders)
         
         supply_res  = f_supply.result()
         largest_res = f_largest.result()
@@ -485,6 +523,7 @@ def check_rug(mint):
         dex_paid    = f_dex.result()
         st_risk     = f_st.result()
         pump_info   = f_pump.result()
+        holders_count = f_holders.result()
 
     try:
         if supply_res and largest_res:
@@ -555,6 +594,7 @@ def check_rug(mint):
         "dex_paid": dex_paid,
         "st_risk": st_risk,
         "pump": pump_info,
+        "holders": holders_count,
     }
 
     return (verdict, score, risks[:8], extra)
@@ -1158,7 +1198,7 @@ async def send_verdict(app, user_id, mint):
         verdict, score, risks, extra = await asyncio.to_thread(check_rug, mint)
     except Exception as e:
         log.error("check_rug crashed for %s: %s", mint, e)
-        verdict, score, risks, extra = ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False})
+        verdict, score, risks, extra = ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None})
 
     emoji = {"SAFE": "✅", "WARN": "⚠️", "DANGER": "🔴", "UNKNOWN": "❓"}.get(verdict, "❓")
     risk_text = (
@@ -1169,10 +1209,16 @@ async def send_verdict(app, user_id, mint):
     
     dex_paid_str = "✅ Paid" if (isinstance(extra, dict) and extra.get("dex_paid")) else "❌ Not Paid"
     info_lines = [f"Dex Paid: {dex_paid_str}"]
+
+    holders = extra.get("holders") if isinstance(extra, dict) else None
+    if holders:
+        info_lines.append(f"Holders: <b>{holders}</b>")
+
     pump_info = extra.get("pump") if isinstance(extra, dict) else None
     if isinstance(pump_info, dict) and pump_info.get("is_pump"):
         pump_str = "🎓 Graduated" if pump_info.get("complete") else "🟡 Bonding Curve"
         info_lines.append(f"Pump.fun: {pump_str}")
+
     info_header = "\n".join(info_lines)
 
     text = (
