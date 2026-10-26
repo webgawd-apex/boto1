@@ -10,6 +10,7 @@ import json
 from dotenv import load_dotenv
 import requests
 from solders.keypair import Keypair
+from solders.pubkey import Pubkey
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -26,10 +27,12 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 HELIUS_KEY = os.environ["HELIUS_KEY"]
+SOLANA_TRACKER_API = os.environ.get("SOLANA_TRACKER_API", "")
 RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
 
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 LAMPORTS_PER_SOL = 1_000_000_000
 
 MAX_WALLETS = 10
@@ -125,10 +128,6 @@ def db_init():
                 private_key TEXT NOT NULL
             )
         """)
-        try:
-            cur.execute("ALTER TABLE wallets ADD COLUMN IF NOT EXISTS paused INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
         log.info("Database initialized: connected to persistent PostgreSQL")
     else:
         cur.execute("""
@@ -327,7 +326,6 @@ def parse_token2022_extensions(data):
         offset += ext_len
     return extensions
 
-
 def fetch_dex_paid(mint):
     try:
         url = f"https://api.dexscreener.com/orders/v1/solana/{mint}"
@@ -356,6 +354,44 @@ def fetch_dex_paid(mint):
     except Exception:
         return False
 
+def fetch_solana_tracker_risk(mint):
+    if not SOLANA_TRACKER_API:
+        return None
+    try:
+        url = f"https://data.solanatracker.io/tokens/{mint}"
+        headers = {"x-api-key": SOLANA_TRACKER_API, "User-Agent": "Mozilla/5.0"}
+        r = _rpc_session.get(url, headers=headers, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                return data.get("risk")
+        return None
+    except Exception as e:
+        log.warning("solana tracker fetch failed for %s: %s", mint, e)
+        return None
+
+def fetch_pump_graduation(mint):
+    try:
+        mint_pubkey = Pubkey.from_string(mint)
+        pump_program = Pubkey.from_string(PUMP_PROGRAM)
+        bc_pda, _ = Pubkey.find_program_address(
+            [b"bonding-curve", bytes(mint_pubkey)],
+            pump_program
+        )
+        acct = rpc("getAccountInfo", [str(bc_pda), {"encoding": "base64"}])
+        if not acct or not acct.get("value"):
+            return None
+        val = acct["value"]
+        if val.get("owner") != PUMP_PROGRAM:
+            return None
+        data = base64.b64decode(val["data"][0])
+        if len(data) < 49:
+            return None
+        complete = data[48] != 0
+        return {"complete": complete, "is_pump": True}
+    except Exception as e:
+        log.warning("pump graduation check failed for %s: %s", mint, e)
+        return None
 
 def check_rug(mint):
     score = 100
@@ -363,22 +399,22 @@ def check_rug(mint):
 
     acct = rpc("getAccountInfo", [mint, {"encoding": "base64"}])
     if not acct or not acct.get("value"):
-        return ("UNKNOWN", 0, ["mint not found"], {"dex_paid": False})
+        return ("UNKNOWN", 0, ["mint not found"], {"dex_paid": False, "st_risk": None, "pump": None})
 
     value = acct["value"]
     owner = value.get("owner", "")
     try:
         data = base64.b64decode(value["data"][0])
     except Exception:
-        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False})
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None})
 
     if len(data) < 82:
-        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False})
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None})
 
     try:
         has_mint_auth, has_freeze_auth = parse_mint_account(data)
     except Exception:
-        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False})
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None})
 
     if has_mint_auth:
         score -= 30
@@ -429,15 +465,26 @@ def check_rug(mint):
     def _fetch_dex_paid():
         return fetch_dex_paid(mint)
 
-    with ThreadPoolExecutor(max_workers=4) as _pool:
+    def _fetch_st_risk():
+        return fetch_solana_tracker_risk(mint)
+
+    def _fetch_pump():
+        return fetch_pump_graduation(mint)
+
+    with ThreadPoolExecutor(max_workers=6) as _pool:
         f_supply  = _pool.submit(_fetch_supply)
         f_largest = _pool.submit(_fetch_largest)
         f_asset   = _pool.submit(_fetch_asset)
         f_dex     = _pool.submit(_fetch_dex_paid)
+        f_st      = _pool.submit(_fetch_st_risk)
+        f_pump    = _pool.submit(_fetch_pump)
+        
         supply_res  = f_supply.result()
         largest_res = f_largest.result()
         asset_res   = f_asset.result()
         dex_paid    = f_dex.result()
+        st_risk     = f_st.result()
+        pump_info   = f_pump.result()
 
     try:
         if supply_res and largest_res:
@@ -462,6 +509,40 @@ def check_rug(mint):
     except Exception as e:
         log.warning("getAsset failed for %s: %s", mint, e)
 
+    if isinstance(st_risk, dict):
+        if st_risk.get("rugged"):
+            score -= 40
+            risks.append("Flagged as rugged (ST)")
+
+        def _get_pct(parent_key, field="totalPercentage"):
+            val = (st_risk.get(parent_key) or {}).get(field) if isinstance(st_risk.get(parent_key), dict) else 0
+            try:
+                return float(val or 0)
+            except (ValueError, TypeError):
+                return 0.0
+
+        snipers = _get_pct("snipers")
+        insiders = _get_pct("insiders")
+        bundlers = _get_pct("bundlers")
+        dev = _get_pct("dev", "percentage")
+
+        if snipers > 10:
+            score -= 15
+            risks.append(f"Snipers hold {snipers:.1f}% (ST)")
+        if insiders > 10:
+            score -= 15
+            risks.append(f"Insiders hold {insiders:.1f}% (ST)")
+        if bundlers > 20:
+            score -= 20
+            risks.append(f"Bundlers hold {bundlers:.1f}% (ST)")
+        if dev > 15:
+            score -= 15
+            risks.append(f"Dev holds {dev:.1f}% (ST)")
+
+    if pump_info and not pump_info.get("complete"):
+        score -= 15
+        risks.append("Still on Pump.fun bonding curve")
+
     score = max(0, min(100, score))
     if score >= 70:
         verdict = "SAFE"
@@ -470,9 +551,13 @@ def check_rug(mint):
     else:
         verdict = "DANGER"
 
-    extra = {"dex_paid": dex_paid}
+    extra = {
+        "dex_paid": dex_paid,
+        "st_risk": st_risk,
+        "pump": pump_info,
+    }
 
-    return (verdict, score, risks[:5], extra)
+    return (verdict, score, risks[:8], extra)
 
 BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 ASK_ADDRESS, ASK_NAME, ASK_IMPORT_KEY = range(3)
@@ -487,7 +572,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /my_wallet - manage your wallet (generate or import)\n"
         "• /create_wallet - generate a new wallet\n"
         "• /import_wallet - import an existing wallet private key\n"
-        "• /new_watch -add a wallet to watch(max 10)\n"
+        "• /new_watch - add a wallet to watch (max 10)\n"
         "• /my_watches - list your tracked wallets\n"
         "• /pause_watch - pause or resume watching a wallet\n"
         "• /remove_watch - remove a watched wallet\n"
@@ -1083,11 +1168,17 @@ async def send_verdict(app, user_id, mint):
     )
     
     dex_paid_str = "✅ Paid" if (isinstance(extra, dict) and extra.get("dex_paid")) else "❌ Not Paid"
-    
+    info_lines = [f"Dex Paid: {dex_paid_str}"]
+    pump_info = extra.get("pump") if isinstance(extra, dict) else None
+    if isinstance(pump_info, dict) and pump_info.get("is_pump"):
+        pump_str = "🎓 Graduated" if pump_info.get("complete") else "🟡 Bonding Curve"
+        info_lines.append(f"Pump.fun: {pump_str}")
+    info_header = "\n".join(info_lines)
+
     text = (
         f"{emoji} <b>{verdict}</b> — safety score {score}/100\n"
         f"CA: <code>{mint}</code>\n"
-        f"Dex Paid: {dex_paid_str}\n\n"
+        f"{info_header}\n\n"
         f"{risk_text}"
     )
 
