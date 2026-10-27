@@ -410,21 +410,66 @@ def fetch_holder_count(mint):
         result = data.get("result")
         if not result:
             return None
-        
         accounts = result.get("token_accounts") or []
         total = result.get("total") or 0
-        
         owners = set()
         for acc in accounts:
             owner = acc.get("owner")
             if owner:
                 owners.add(owner)
-                
         if len(accounts) >= 1000:
             return f"{len(owners)}+"
         return str(len(owners))
     except Exception as e:
         log.warning("holder count fetch failed for %s: %s", mint, e)
+        return None
+
+def fetch_dex_metrics(mint):
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        r = _rpc_session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return None
+        
+        best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+        
+        liquidity = float((best.get("liquidity") or {}).get("usd") or 0)
+        volume = float((best.get("volume") or {}).get("h24") or 0)
+        market_cap = float(best.get("marketCap") or best.get("fdv") or 0)
+        txns = (best.get("txns") or {}).get("h24") or {}
+        buys = int(txns.get("buys") or 0)
+        sells = int(txns.get("sells") or 0)
+        total_txns = buys + sells
+        
+        created_at = best.get("pairCreatedAt")
+        age_hours = None
+        if created_at:
+            age_hours = (time.time() * 1000 - float(created_at)) / 3_600_000
+        
+        info = best.get("info") or {}
+        socials = info.get("socials") or []
+        websites = info.get("websites") or []
+        
+        twitter_url = next((s.get("url") for s in socials if s.get("type") in ("twitter", "x")), None)
+        telegram_url = next((s.get("url") for s in socials if s.get("type") == "telegram"), None)
+        website_url = websites[0].get("url") if websites else None
+        
+        return {
+            "liquidity": liquidity,
+            "volume": volume,
+            "market_cap": market_cap,
+            "txns": total_txns,
+            "age_hours": age_hours,
+            "twitter_url": twitter_url,
+            "telegram_url": telegram_url,
+            "website_url": website_url,
+        }
+    except Exception as e:
+        log.warning("dex metrics fetch failed for %s: %s", mint, e)
         return None
 
 def check_rug(mint):
@@ -433,22 +478,22 @@ def check_rug(mint):
 
     acct = rpc("getAccountInfo", [mint, {"encoding": "base64"}])
     if not acct or not acct.get("value"):
-        return ("UNKNOWN", 0, ["mint not found"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None})
+        return ("UNKNOWN", 0, ["mint not found"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None, "dex_metrics": None})
 
     value = acct["value"]
     owner = value.get("owner", "")
     try:
         data = base64.b64decode(value["data"][0])
     except Exception:
-        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None})
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None, "dex_metrics": None})
 
     if len(data) < 82:
-        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None})
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None, "dex_metrics": None})
 
     try:
         has_mint_auth, has_freeze_auth = parse_mint_account(data)
     except Exception:
-        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None})
+        return ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None, "dex_metrics": None})
 
     if has_mint_auth:
         score -= 30
@@ -508,7 +553,10 @@ def check_rug(mint):
     def _fetch_holders():
         return fetch_holder_count(mint)
 
-    with ThreadPoolExecutor(max_workers=7) as _pool:
+    def _fetch_dex_metrics():
+        return fetch_dex_metrics(mint)
+
+    with ThreadPoolExecutor(max_workers=8) as _pool:
         f_supply  = _pool.submit(_fetch_supply)
         f_largest = _pool.submit(_fetch_largest)
         f_asset   = _pool.submit(_fetch_asset)
@@ -516,6 +564,7 @@ def check_rug(mint):
         f_st      = _pool.submit(_fetch_st_risk)
         f_pump    = _pool.submit(_fetch_pump)
         f_holders = _pool.submit(_fetch_holders)
+        f_dex_met = _pool.submit(_fetch_dex_metrics)
         
         supply_res  = f_supply.result()
         largest_res = f_largest.result()
@@ -524,6 +573,7 @@ def check_rug(mint):
         st_risk     = f_st.result()
         pump_info   = f_pump.result()
         holders_count = f_holders.result()
+        dex_metrics = f_dex_met.result()
 
     try:
         if supply_res and largest_res:
@@ -582,6 +632,17 @@ def check_rug(mint):
         score -= 15
         risks.append("Still on Pump.fun bonding curve")
 
+    if dex_metrics:
+        if dex_metrics["liquidity"] < 10_000:
+            score -= 15
+            risks.append(f"Low liquidity (${dex_metrics['liquidity']:,.0f})")
+        if dex_metrics["volume"] == 0:
+            score -= 10
+            risks.append("No 24h volume")
+        if dex_metrics["age_hours"] is not None and dex_metrics["age_hours"] < 1:
+            score -= 10
+            risks.append("Pair < 1 hour old")
+
     score = max(0, min(100, score))
     if score >= 70:
         verdict = "SAFE"
@@ -595,6 +656,10 @@ def check_rug(mint):
         "st_risk": st_risk,
         "pump": pump_info,
         "holders": holders_count,
+        "dex_metrics": dex_metrics,
+        "score": score,
+        "verdict": verdict,
+        "risks": risks[:8],
     }
 
     return (verdict, score, risks[:8], extra)
@@ -1193,12 +1258,11 @@ async def send_sell_alert(app, user_id, name, mint, address):
         log.warning("sell alert send failed: %s", e)
 
 async def send_verdict(app, user_id, mint):
-
     try:
         verdict, score, risks, extra = await asyncio.to_thread(check_rug, mint)
     except Exception as e:
         log.error("check_rug crashed for %s: %s", mint, e)
-        verdict, score, risks, extra = ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None})
+        verdict, score, risks, extra = ("UNKNOWN", 0, ["data unavailable"], {"dex_paid": False, "st_risk": None, "pump": None, "holders": None, "dex_metrics": None})
 
     emoji = {"SAFE": "✅", "WARN": "⚠️", "DANGER": "🔴", "UNKNOWN": "❓"}.get(verdict, "❓")
     risk_text = (
@@ -1229,14 +1293,8 @@ async def send_verdict(app, user_id, mint):
     )
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "🔍 Birdeye",
-            url=f"https://birdeye.so/token/{mint}",
-        ),
-        InlineKeyboardButton(
-            "⚡ Trade on Jupiter",
-            url=f"https://jup.ag/swap/SOL-{mint}",
-        ),
+        InlineKeyboardButton("📊 Show Full Metrics", callback_data=f"showmet:{mint}"),
+        InlineKeyboardButton("⚡ Trade on Jupiter", url=f"https://jup.ag/swap/SOL-{mint}"),
     ]])
 
     try:
@@ -1249,6 +1307,115 @@ async def send_verdict(app, user_id, mint):
         )
     except Exception as e:
         log.warning("verdict send failed: %s", e)
+
+async def on_show_metrics_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    if not data.startswith("showmet:"):
+        return
+
+    mint = data[8:]
+
+    try:
+        verdict, score, risks, extra = await asyncio.to_thread(check_rug, mint)
+    except Exception as e:
+        log.error("check_rug crashed for showmet %s: %s", mint, e)
+        await query.edit_message_text("Failed to fetch full metrics. Try again later.")
+        return
+
+    emoji = {"SAFE": "✅", "WARN": "⚠️", "DANGER": "🔴", "UNKNOWN": "❓"}.get(verdict, "❓")
+    
+    dex = extra.get("dex_metrics") if isinstance(extra, dict) else None
+    st_risk = extra.get("st_risk") if isinstance(extra, dict) else None
+    pump_info = extra.get("pump") if isinstance(extra, dict) else None
+    holders = extra.get("holders") if isinstance(extra, dict) else None
+
+    lines = [
+        f"{emoji} <b>{verdict}</b> — safety score {score}/100",
+        f"CA: <code>{mint}</code>",
+        "",
+        f"<b>Market Metrics:</b>",
+    ]
+
+    if dex:
+        lines.append(f"• Liquidity: <b>${dex['liquidity']:,.0f}</b>")
+        lines.append(f"• Volume (24h): <b>${dex['volume']:,.0f}</b>")
+        lines.append(f"• Market Cap: <b>${dex['market_cap']:,.0f}</b>")
+        lines.append(f"• Txns (24h): <b>{dex['txns']}</b>")
+        if dex['age_hours'] is not None:
+            lines.append(f"• Age: <b>{dex['age_hours']:.1f}h</b>")
+        
+        socials = []
+        if dex.get('twitter_url'):
+            socials.append(f"<a href='{html.escape(dex['twitter_url'], quote=True)}'>Twitter</a>")
+        if dex.get('telegram_url'):
+            socials.append(f"<a href='{html.escape(dex['telegram_url'], quote=True)}'>Telegram</a>")
+        if dex.get('website_url'):
+            socials.append(f"<a href='{html.escape(dex['website_url'], quote=True)}'>Website</a>")
+        lines.append(f"• Socials: <b>{' | '.join(socials) if socials else 'None'}</b>")
+    else:
+        lines.append("• <i>No DexScreener data available</i>")
+
+    lines.append("")
+    lines.append("<b>On-Chain:</b>")
+    if holders:
+        lines.append(f"• Holders: <b>{holders}</b>")
+    
+    if isinstance(st_risk, dict):
+        def _get_pct(parent_key, field="totalPercentage"):
+            val = (st_risk.get(parent_key) or {}).get(field) if isinstance(st_risk.get(parent_key), dict) else 0
+            try:
+                return float(val or 0)
+            except (ValueError, TypeError):
+                return 0.0
+        
+        lines.append(f"• Dev Holding: <b>{_get_pct('dev', 'percentage'):.1f}%</b>")
+        lines.append(f"• Insiders: <b>{_get_pct('insiders'):.1f}%</b>")
+        lines.append(f"• Bundlers: <b>{_get_pct('bundlers'):.1f}%</b>")
+        lines.append(f"• Snipers: <b>{_get_pct('snipers'):.1f}%</b>")
+    
+    if isinstance(pump_info, dict) and pump_info.get("is_pump"):
+        pump_str = "🎓 Graduated" if pump_info.get("complete") else "🟡 Bonding Curve"
+        lines.append(f"• Pump.fun: <b>{pump_str}</b>")
+
+    lines.append("")
+    lines.append("<b>Risks:</b>")
+    if risks:
+        for r in risks:
+            lines.append(f"• {html.escape(r)}")
+    else:
+        lines.append("• No structural red flags found.")
+
+    full_text = "\n".join(lines)
+
+    new_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⚡ Trade on Jupiter", url=f"https://jup.ag/swap/SOL-{mint}"),
+    ]])
+
+    try:
+        await query.edit_message_text(
+            text=full_text,
+            parse_mode="HTML",
+            reply_markup=new_keyboard,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.warning("edit full metrics failed: %s", e)
+        try:
+            chat_id = query.message.chat_id if query.message else query.from_user.id
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=full_text,
+                parse_mode="HTML",
+                reply_markup=new_keyboard,
+                disable_web_page_preview=True,
+            )
+            if query.message:
+                await query.message.delete()
+        except Exception as e2:
+            log.error("fallback send full metrics failed: %s", e2)
 
 async def monitor_loop(app):
     log.info("monitor loop started")
@@ -1448,6 +1615,7 @@ def main():
     application.add_handler(CallbackQueryHandler(on_trading_wallet_callback, pattern=r"^twal:"))
     application.add_handler(CallbackQueryHandler(on_remove_callback, pattern=r"^rm:"))
     application.add_handler(CallbackQueryHandler(on_pause_callback, pattern=r"^pg:"))
+    application.add_handler(CallbackQueryHandler(on_show_metrics_callback, pattern=r"^showmet:"))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
     application.add_error_handler(on_error)
 
