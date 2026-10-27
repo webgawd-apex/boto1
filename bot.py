@@ -280,7 +280,7 @@ def db_all_wallets():
     return rows
 
 _rpc_session = requests.Session()
-_rpc_adapter = HTTPAdapter(pool_connections=25, pool_maxsize=25)
+_rpc_adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50)
 _rpc_session.mount("https://", _rpc_adapter)
 _rpc_session.mount("http://", _rpc_adapter)
 
@@ -458,6 +458,8 @@ def fetch_dex_metrics(mint):
         telegram_url = next((s.get("url") for s in socials if s.get("type") == "telegram"), None)
         website_url = websites[0].get("url") if websites else None
         
+        price_usd = float(best.get("priceUsd") or 0)
+        
         return {
             "liquidity": liquidity,
             "volume": volume,
@@ -467,10 +469,56 @@ def fetch_dex_metrics(mint):
             "twitter_url": twitter_url,
             "telegram_url": telegram_url,
             "website_url": website_url,
+            "price_usd": price_usd,
         }
     except Exception as e:
         log.warning("dex metrics fetch failed for %s: %s", mint, e)
         return None
+
+def fetch_token_metadata(mint):
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "asset-check",
+            "method": "getAsset",
+            "params": {"id": mint}
+        }
+        r = _rpc_session.post(RPC_URL, json=payload, timeout=10)
+        data = r.json()
+        result = data.get("result")
+        if result:
+            content = result.get("content") or {}
+            metadata = content.get("metadata") or {}
+            name = metadata.get("name") or "Unknown"
+            symbol = metadata.get("symbol") or ""
+            return {"name": name, "symbol": symbol}
+        return None
+    except Exception as e:
+        log.warning("token metadata fetch failed for %s: %s", mint, e)
+        return None
+
+def get_wallet_token_balance(wallet_address, mint):
+    try:
+        res = rpc("getTokenAccountsByOwner", [
+            wallet_address,
+            {"mint": mint},
+            {"encoding": "jsonParsed"}
+        ])
+        if not res:
+            return 0.0
+        accounts = res.get("value") or []
+        total = 0.0
+        for acc in accounts:
+            try:
+                info = acc["account"]["data"]["parsed"]["info"]
+                amt = float(info["tokenAmount"]["uiAmountString"] or 0)
+                total += amt
+            except (KeyError, TypeError, ValueError):
+                continue
+        return total
+    except Exception as e:
+        log.warning("wallet token balance failed for %s/%s: %s", wallet_address, mint, e)
+        return 0.0
 
 def check_rug(mint):
     score = 100
@@ -1019,6 +1067,7 @@ async def recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         baselines[(user_id, addr)] = mints
+        sol_balances[(user_id, addr)] = await asyncio.to_thread(get_sol_balance, addr)
         await update.effective_message.reply_text(
             f"✅ Now watching <b>{html.escape(name)}</b>\n"
             f"<code>{addr}</code>\n\n"
@@ -1175,6 +1224,7 @@ async def on_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if removed:
             if addr:
                 baselines.pop((user_id, addr), None)
+                sol_balances.pop((user_id, addr), None)
             await query.edit_message_text(
                 f"✅ Removed <b>{html.escape(name)}</b>.",
                 parse_mode="HTML",
@@ -1196,6 +1246,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Telegram handler error: %s", context.error)
 
 baselines = {}
+sol_balances = {}
 
 def fetch_wallet_mints(address):
     mints = set()
@@ -1219,15 +1270,31 @@ def fetch_wallet_mints(address):
 
     return mints
 
-async def send_buy_alert(app, user_id, name, mint, address):
-    sol = await asyncio.to_thread(get_sol_balance, address)
-    sol_str = f"{sol:.4f} SOL" if sol is not None else "unavailable"
+async def send_buy_alert(app, user_id, name, mint, address, prev_sol):
+    sol_task = asyncio.to_thread(get_sol_balance, address)
+    meta_task = asyncio.to_thread(fetch_token_metadata, mint)
+    dex_task = asyncio.to_thread(fetch_dex_metrics, mint)
+
+    current_sol, meta, dex = await asyncio.gather(sol_task, meta_task, dex_task)
+
+    sol_str = f"{current_sol:.4f} SOL" if current_sol is not None else "unavailable"
+    sol_spent = max(0.0, (prev_sol or 0) - (current_sol or 0)) if current_sol is not None and prev_sol is not None else 0.0
+    sol_spent_str = f"{sol_spent:.4f} SOL" if sol_spent > 0 else "unknown"
+
+    token_name = f"{meta['name']} ({meta['symbol']})" if meta else mint[:8]
+    price_usd = (dex or {}).get("price_usd", 0) or 0
+
+    current_ui = await asyncio.to_thread(get_wallet_token_balance, address, mint)
+    usd_est = current_ui * price_usd if price_usd > 0 else 0
+    usd_str = f"${usd_est:,.2f}" if usd_est > 0 else "unknown"
+
     try:
         await app.bot.send_message(
             chat_id=user_id,
             text=(
                 f"🚨 <b>{html.escape(name)}</b> just bought a token!\n"
                 f"CA: <code>{mint}</code>\n"
+                f"Bought: <b>{html.escape(token_name)}</b> - <b>{usd_str}</b> - <b>{sol_spent_str}</b>\n"
                 f"Wallet balance: <b>{sol_str}</b>\n"
                 f"<i>Scanning chain for risks...</i>"
             ),
@@ -1474,6 +1541,7 @@ async def monitor_loop(app):
                 try:
                     if key not in baselines:
                         baselines[key] = mints
+                        sol_balances[key] = await asyncio.to_thread(get_sol_balance, address)
                         log.info(
                             "baseline seeded for %s/%s (%d mints)",
                             user_id, name, len(mints),
@@ -1488,14 +1556,19 @@ async def monitor_loop(app):
 
                         for mint in new_mints:
                             new_count += 1
+                            prev_sol = sol_balances.get(key)
                             log.info("buy: mint %s for %s (%s)", mint, name, user_id)
-                            await send_buy_alert(app, user_id, name, mint, address)
+                            await send_buy_alert(app, user_id, name, mint, address, prev_sol)
                             await send_verdict(app, user_id, mint)
 
                         for mint in sold_mints:
                             sell_count += 1
                             log.info("sell: mint %s for %s (%s)", mint, name, user_id)
                             await send_sell_alert(app, user_id, name, mint, address)
+
+                        new_sol = await asyncio.to_thread(get_sol_balance, address)
+                        if new_sol is not None:
+                            sol_balances[key] = new_sol
 
                 except Exception as e:
                     fail_count += 1
@@ -1505,6 +1578,7 @@ async def monitor_loop(app):
             for key in list(baselines.keys()):
                 if key not in still_present:
                     del baselines[key]
+                    sol_balances.pop(key, None)
 
         except Exception as e:
             log.error("monitor loop iteration failed: %s", e)
@@ -1528,7 +1602,7 @@ async def post_init(app):
         await app.bot.set_my_commands([
             BotCommand("start",          "Start"),
             BotCommand("my_wallet",      "Manage wallet (generate or import)"),
-            BotCommand("create_wallet",   "Generate a new wallet"),
+            BotCommand("create_wallet",  "Generate a new wallet"),
             BotCommand("import_wallet",  "Import an existing wallet"),
             BotCommand("new_watch",      "Watch a Solana wallet(up to 10)"),
             BotCommand("my_watches",     "List tracked wallets"),
