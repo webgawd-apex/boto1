@@ -1,4 +1,4 @@
-import os
+﻿import os
 import asyncio
 import sqlite3
 import base64
@@ -1279,14 +1279,14 @@ async def send_buy_alert(app, user_id, name, mint, address, prev_sol):
 
     sol_str = f"{current_sol:.4f} SOL" if current_sol is not None else "unavailable"
     sol_spent = max(0.0, (prev_sol or 0) - (current_sol or 0)) if current_sol is not None and prev_sol is not None else 0.0
-    sol_spent_str = f"{sol_spent:.4f} SOL" if sol_spent > 0 else "unknown"
+    sol_spent_str = f"{sol_spent:.4f} SOL" if sol_spent > 0 else "0.0000 SOL"
 
     token_name = f"{meta['name']} ({meta['symbol']})" if meta else mint[:8]
     price_usd = (dex or {}).get("price_usd", 0) or 0
 
     current_ui = await asyncio.to_thread(get_wallet_token_balance, address, mint)
     usd_est = current_ui * price_usd if price_usd > 0 else 0
-    usd_str = f"${usd_est:,.2f}" if usd_est > 0 else "unknown"
+    usd_str = f"${usd_est:,.2f}" if usd_est > 0 else "$0.00"
 
     try:
         await app.bot.send_message(
